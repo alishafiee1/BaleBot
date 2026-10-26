@@ -1,0 +1,30 @@
+[Unit]
+Description=BaleBot LLM proxy for sandboxes (bound to the sandbox bridge only)
+After=network-online.target incus.service
+Wants=network-online.target
+
+[Service]
+User=balebot
+Group=balebot
+WorkingDirectory=/opt/balebot
+EnvironmentFile=/etc/balebot/env
+# must match deploy/incus-host-setup.sh: GATEWAY and PROXY_PORT
+ExecStart=/opt/balebot/.venv/bin/uvicorn balebot.main:proxy_app_factory --factory --host 10.77.0.1 --port 8001
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/balebot
+
+[Install]
+WantedBy=multi-user.target

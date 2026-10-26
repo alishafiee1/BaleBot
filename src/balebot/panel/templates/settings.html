@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}مدل پایه{% endblock %}
+{% block content %}
+<h1>مدل پایه</h1>
+<div class="card">
+  <p class="muted">مدلی که کاربران بعد از شروع به آن وصل می‌شوند. تغییرها فوری اعمال می‌شود.
+    کلید API مدل پایه از فایل <span dir="ltr">.env</span> سرور خوانده می‌شود
+    ({{ 'تنظیم شده ✅' if key_set else 'تنظیم نشده ❌' }}) و در پنل نمایش داده نمی‌شود.</p>
+  <form method="post" action="/panel/settings">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label for="bu">آدرس API (سازگار با OpenAI، فقط https)</label>
+    <input id="bu" name="base_url" dir="ltr" value="{{ cfg.base_url }}" required>
+    <label for="bm">نام مدل</label>
+    <input id="bm" name="base_model" dir="ltr" value="{{ cfg.base_model }}" maxlength="128" required>
+    <label for="dq">سهمیه‌ی روزانه‌ی پیش‌فرض هر کاربر</label>
+    <input id="dq" name="daily_quota" type="number" min="0" max="100000"
+           value="{{ cfg.daily_quota }}" required>
+    <label for="sp">پرامپت سیستم</label>
+    <textarea id="sp" name="system_prompt" rows="6" maxlength="4000">{{ cfg.system_prompt }}</textarea>
+    <p><button>ذخیره</button></p>
+  </form>
+</div>
+{% endblock %}

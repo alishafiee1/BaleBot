@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}داشبورد{% endblock %}
+{% block content %}
+<h1>داشبورد</h1>
+<div class="grid">
+  <div class="card stat"><b>{{ stats.users }}</b><span>کل کاربران</span></div>
+  <div class="card stat"><b>{{ stats.active_today }}</b><span>کاربر فعال امروز</span></div>
+  <div class="card stat"><b>{{ stats.requests_today }}</b><span>درخواست امروز</span></div>
+  <div class="card stat"><b>{{ stats.banned }}</b><span>مسدود</span></div>
+  <div class="card stat"><b>{{ stats.messages }}</b><span>پیام ذخیره‌شده</span></div>
+</div>
+<div class="card">
+  <strong>مدل پایه‌ی فعلی</strong>
+  <p dir="ltr" style="text-align:left;margin:6px 0 0">{{ cfg.base_model }} @ {{ cfg.base_url }}</p>
+  <p class="muted">سهمیه‌ی روزانه‌ی پیش‌فرض: {{ cfg.daily_quota }} درخواست برای هر کاربر</p>
+</div>
+{% endblock %}

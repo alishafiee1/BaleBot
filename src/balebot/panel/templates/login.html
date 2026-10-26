@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}ورود{% endblock %}
+{% block content %}
+<div class="login card">
+  <h1>ورود به پنل مدیریت</h1>
+  <form method="post" action="/panel/login" autocomplete="off">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label for="u">نام کاربری</label>
+    <input id="u" name="username" dir="ltr" required autofocus>
+    <label for="p">رمز عبور</label>
+    <input id="p" name="password" type="password" dir="ltr" required>
+    <p><button>ورود</button></p>
+  </form>
+</div>
+{% endblock %}

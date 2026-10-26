@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}کاربران{% endblock %}
+{% block content %}
+<h1>کاربران</h1>
+<form method="get" action="/panel/users" style="margin-bottom:12px;display:flex;gap:8px">
+  <input name="q" value="{{ q }}" placeholder="جستجوی نام کاربری یا شناسه‌ی بله" maxlength="64">
+  <button>جستجو</button>
+</form>
+<div class="card table-wrap">
+<table>
+  <thead><tr><th>شناسه</th><th>نام کاربری</th><th>امروز</th><th>سهمیه</th><th>وضعیت</th><th></th></tr></thead>
+  <tbody>
+  {% for user, used in rows %}
+  <tr>
+    <td dir="ltr">{{ user.bale_id }}</td>
+    <td dir="ltr">{{ user.username or '—' }}</td>
+    <td>{{ used }}</td>
+    <td>
+      <form method="post" action="/panel/users/{{ user.id }}/quota">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input name="quota" type="number" min="0" max="100000" value="{{ user.daily_quota if user.daily_quota is not none else '' }}" placeholder="{{ default_quota }}">
+        <button class="ghost">ثبت</button>
+      </form>
+    </td>
+    <td>{% if user.banned %}<span class="tag bad">مسدود</span>{% else %}<span class="tag">فعال</span>{% endif %}</td>
+    <td>
+      <form method="post" action="/panel/users/{{ user.id }}/ban">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button class="{{ 'ghost' if user.banned else 'danger' }}">{{ 'رفع مسدودی' if user.banned else 'مسدود' }}</button>
+      </form>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="6" class="muted">کاربری پیدا نشد.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="muted">حداکثر ۱۰۰ کاربر آخر. سهمیه‌ی خالی یعنی پیش‌فرض ({{ default_quota }}).</p>
+</div>
+{% endblock %}

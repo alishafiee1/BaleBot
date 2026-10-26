@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>{% block title %}پنل مدیریت{% endblock %} · BaleBot</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1b1f24; --muted:#667085; --line:#e4e7ec;
+          --brand:#1d6fe0; --danger:#c0392b; --ok:#1e8e3e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14171c; --card:#1c2128; --ink:#e6e9ee; --muted:#9aa4b2; --line:#2c333d;
+            --brand:#5b9bff; --danger:#ff7b6b; --ok:#5fd07f; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:15px/1.7 Tahoma, "Segoe UI", system-ui, sans-serif; }
+  header { background:var(--card); border-bottom:1px solid var(--line); }
+  .bar { max-width:1000px; margin:auto; padding:10px 16px; display:flex; gap:16px;
+         align-items:center; flex-wrap:wrap; }
+  .bar a { color:var(--muted); text-decoration:none; padding:4px 10px; border-radius:8px; }
+  .bar a.on, .bar a:hover { color:var(--ink); background:var(--bg); }
+  .bar form { margin-inline-start:auto; }
+  main { max-width:1000px; margin:24px auto; padding:0 16px; }
+  h1 { font-size:20px; margin:0 0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px;
+          margin-bottom:16px; }
+  .stat b { display:block; font-size:26px; }
+  .stat span, .muted { color:var(--muted); font-size:13px; }
+  label { display:block; margin:14px 0 4px; font-weight:600; }
+  input, textarea { width:100%; padding:9px 11px; border:1px solid var(--line); border-radius:8px;
+                    background:var(--bg); color:var(--ink); font:inherit; }
+  input[dir=ltr], textarea[dir=ltr] { text-align:left; }
+  button { padding:8px 16px; border:0; border-radius:8px; background:var(--brand); color:#fff;
+           font:inherit; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--muted); border:1px solid var(--line); }
+  button.danger { background:var(--danger); }
+  .msg { padding:10px 14px; border-radius:8px; margin-bottom:16px; }
+  .msg.ok { background:color-mix(in srgb,var(--ok) 15%,transparent); color:var(--ok); }
+  .msg.err { background:color-mix(in srgb,var(--danger) 15%,transparent); color:var(--danger); }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:start; padding:9px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; font-size:13px; }
+  td form { display:inline-flex; gap:6px; align-items:center; }
+  td input { width:80px; padding:5px 8px; }
+  .table-wrap { overflow-x:auto; }
+  .tag { font-size:12px; padding:2px 8px; border-radius:99px; background:var(--bg); }
+  .tag.bad { color:var(--danger); }
+  .login { max-width:380px; margin:12vh auto; }
+</style>
+</head>
+<body>
+{% if admin %}
+<header><nav class="bar">
+  <strong>BaleBot</strong>
+  {% if not forced %}
+  <a href="/panel/" class="{{ 'on' if page == 'dashboard' }}">داشبورد</a>
+  <a href="/panel/settings" class="{{ 'on' if page == 'settings' }}">مدل پایه</a>
+  <a href="/panel/users" class="{{ 'on' if page == 'users' }}">کاربران</a>
+  <a href="/panel/password" class="{{ 'on' if page == 'password' }}">رمز</a>
+  {% endif %}
+  <form method="post" action="/panel/logout">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button class="ghost">خروج ({{ admin.username }})</button>
+  </form>
+</nav></header>
+{% endif %}
+<main>
+  {% if flash %}<div class="msg ok">{{ flash }}</div>{% endif %}
+  {% if error %}<div class="msg err">{{ error }}</div>{% endif %}
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>
