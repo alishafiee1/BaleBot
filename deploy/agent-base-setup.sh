@@ -6,11 +6,12 @@
 # gets its model access from the LLM proxy at run time (`--provider custom --base-url ... --api-key
 # <short-lived token>`), so nothing has to be baked in. The script checks that at the end.
 set -euo pipefail
+exec </dev/null  # never let a wrapper's leftover stdin (e.g. a sudo password) reach incus
 
 PROJECT=${PROJECT:-balebot}
 NAME=${NAME:-agent-base}
 IMAGE=${IMAGE:-images:debian/13}
-INSTALLER=${INSTALLER:-https://hermes-agent.nousresearch.com/install.sh}
+HERMES_COMMIT=${HERMES_COMMIT:-046094df28b712f62a5e3c728a9e59da05dcbf1e}
 
 sbx() { incus exec "$NAME" --project "$PROJECT" -- "$@"; }
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
@@ -20,7 +21,9 @@ if incus info "$NAME" --project "$PROJECT" >/dev/null 2>&1; then
   exit 1
 fi
 
-incus launch "$IMAGE" "$NAME" --project "$PROJECT" -c security.privileged=false
+# root size must equal BALEBOT_SANDBOX_DISK: clones cannot be given a smaller quota than the template
+incus launch "$IMAGE" "$NAME" --project "$PROJECT" -c security.privileged=false \
+  -c limits.memory=1GiB -c limits.cpu=2 -d root,size=3GiB
 for _ in $(seq 1 30); do sbx true 2>/dev/null && break; sleep 1; done
 
 sbx apt-get update
@@ -29,9 +32,10 @@ sbx env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommend
 sbx useradd --create-home --uid 1000 --shell /bin/bash agent
 sbx install -d -o agent -g agent -m 0700 /home/agent/in /home/agent/outbox
 
-echo "== installing Hermes as 'agent' with the official installer: $INSTALLER"
-echo "   (if it asks questions, answer them in a shell: incus exec $NAME --project $PROJECT -- su - agent)"
-sbx su - agent -c "curl -fsSL '$INSTALLER' | bash"
+echo "== installing Hermes $HERMES_COMMIT as 'agent' from GitHub"
+# The website installer (hermes-agent.nousresearch.com) answers 403 to this server, so we use the
+# repository's own installer, pinned to the commit that already runs on the hermes container.
+sbx su - agent -c "git clone --quiet https://github.com/NousResearch/hermes-agent.git ~/.hermes/hermes-agent && cd ~/.hermes/hermes-agent && git checkout --quiet $HERMES_COMMIT && bash scripts/install.sh --commit $HERMES_COMMIT --non-interactive --skip-browser --skip-computer-use"
 sbx ln -sf /home/agent/.local/bin/hermes /usr/local/bin/hermes
 sbx su - agent -c 'hermes --version'
 

@@ -1,41 +1,57 @@
 # BaleBot
 
-Multi-user Bale bot on top of Hermes. Design: see [PROPOSAL.md](PROPOSAL.md).
+A multi-user [Bale](https://bale.ai) bot on top of [Hermes](https://github.com/NousResearch/hermes-agent).
+Every user chats with a free base model (100 requests a day), can bring their own API keys for any
+OpenAI-compatible provider, and can run Hermes tools inside a private, locked-down sandbox.
 
-## Status (phase 0 + 1 + 2)
-- Multi-user: `/start` connects the user to the base model set in the admin settings
-- 100 free requests/day/user (Asia/Tehran day), refunded when the model call fails
-- Base model, prompt and default quota editable through the admin API (`/admin/api/settings`)
-- 6-month message retention (`python -m balebot.cli purge`, run daily from cron)
-- Webhook at `/bale/webhook/{secret}` (production) or `poll` (development)
+| | |
+|---|---|
+| Stack | Python 3.12+, FastAPI, SQLAlchemy 2 (async), PostgreSQL (SQLite for dev), Incus |
+| Tests | 92 tests, `pytest`; lint with `ruff` |
+| Status | Phases 0-3 done and tested. Phase 4 (sandbox) is built and tested against fakes; the real server is being set up and **isolation is not yet verified** (see [security](docs/security.md)). |
 
-- Web panel at `/panel/`: login (forced password change on first login, CSRF, rate limit, 8h session), dashboard, base model settings, users (ban, per-user quota)
+## What it does
+- **Free base model.** `/start` connects the user to the base model chosen in the admin panel. 100 requests per day
+  per user (Asia/Tehran day), refunded when the model fails.
+- **Personal API keys.** The user says "I want to give you an API key". The bot works out how to talk to that provider,
+  asks for the key, deletes the message that held it, and stores it encrypted. Other users never see it.
+- **Model menu.** Each user picks from the base model plus the models of their own keys.
+- **Agent sandbox.** `/agent <task>` runs Hermes tools in the user's own unprivileged container. The container holds no keys.
+- **Admin panel.** Web UI at `/panel/` for the base model, quotas and users.
 
-- Personal API keys (phase 3): `/addkey` (or saying "I want to give you an API key"), `/keys`, `/delkey N`,
-  `/addmodel N name`, model menu `/models` + `/model N` (and inline buttons). Keys are AES-256-GCM
-  encrypted (bound to owner + key id), the message holding a key is deleted from the chat, the AI that
-  builds a provider config never sees the key, and outbound calls are public-https-only with pinned DNS.
-  Requests made with a user's own key do not use the free daily quota. Needs `BALEBOT_VAULT_KEY`
-  (`python -m balebot.cli gen-vault-key`). Back that key up: without it stored keys are unreadable.
-
-- Agent sandbox (phase 4): `/agent <task>` runs Hermes (`hermes chat --oneshot`) inside the user's own
-  unprivileged Incus container. The sandbox holds no keys: it reaches models only through the LLM proxy
-  (`balebot.main:proxy_app_factory`) with a short-lived, call-capped token. Off by default
-  (`BALEBOT_SANDBOX_ENABLED`). **Not deployed or tested against a real Incus yet** — see
-  [deploy/README.md](deploy/README.md) for the setup order, the isolation check, and known unknowns.
-
-Not yet: Alembic migrations, per-user rate limit on own-key requests, sending user files into sandboxes.
-
-## Setup
+## Quick start (development)
 ```sh
 uv venv && uv pip install -e . pytest pytest-asyncio ruff
-cp .env.example .env            # fill in token, webhook secret, base model key, session secret
-uv run --no-sync pytest
-uv run --no-sync python -m balebot.cli create-admin   # prints the admin password once
-uv run --no-sync python -m balebot.cli poll           # dev
-uv run --no-sync uvicorn balebot.main:app_factory --factory   # production, behind nginx + HTTPS
-uv run --no-sync python -m balebot.cli set-webhook    # after DNS/HTTPS for roditeam.ir works
+cp .env.example .env                                    # fill in what you need
+uv run --no-sync pytest                                  # all tests, no network, no secrets
+uv run --no-sync python -m balebot.cli create-admin      # prints the admin password once
+uv run --no-sync python -m balebot.cli poll              # talk to a real bot without a webhook
 ```
+Production setup, the sandbox and rollback are in [docs/operations.md](docs/operations.md).
 
-## Layout
-`gateway/` Bale I/O · `services/` chat, quota, runtime settings, model client · `api/` admin API · `cli.py` operations
+## Documentation
+| Document | Read it to |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | understand the parts and how a message flows |
+| [docs/configuration.md](docs/configuration.md) | find every setting |
+| [docs/bot-commands.md](docs/bot-commands.md) | see what users and admins can do |
+| [docs/security.md](docs/security.md) | see the threat model, the controls and what is **not** proven yet |
+| [docs/operations.md](docs/operations.md) | deploy, back up, debug and roll back |
+| [docs/code-search.md](docs/code-search.md) | search the code as a graph with Graphify |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | set up, test, and the rules for changes |
+| [CHANGELOG.md](CHANGELOG.md) | see what changed |
+| [docs/history/proposal-fa.md](docs/history/proposal-fa.md) | read the original design proposal (Persian, historical) |
+
+## Project layout
+```
+src/balebot/
+  gateway/    Bale API client and update handling
+  services/   chat, quota, personal keys, provider configs, model client, runtime settings
+  sandbox/    Incus runner, per-user sandbox manager, LLM proxy, proxy tokens
+  net/        SSRF-safe outbound HTTP
+  panel/      admin web panel (Jinja2, server rendered)
+  api/        admin JSON API
+  vault.py    AES-256-GCM encryption for user keys
+deploy/       server setup scripts and systemd units
+tests/        pytest (fakes for Bale, models, providers and Incus)
+```

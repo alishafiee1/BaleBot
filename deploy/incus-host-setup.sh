@@ -14,6 +14,10 @@
 #
 # Roll back: see deploy/README.md.
 set -euo pipefail
+# Some incus subcommands (storage create, ...) read stdin as YAML when it is not a terminal. If a
+# wrapper such as a sudo helper feeds a password on stdin, it would leak into incus and its error
+# messages. Always start from an empty stdin.
+exec </dev/null
 
 POOL=${POOL:-sandbox}
 POOL_SIZE=${POOL_SIZE:-20GiB}
@@ -45,18 +49,18 @@ exists incus network acl show "$ACL" || incus network acl create "$ACL"
 incus network acl edit "$ACL" <<YAML
 description: BaleBot sandbox egress
 egress:
-  - {action: allow, protocol: tcp, destination: "$GATEWAY/32", destination_port: "$PROXY_PORT", state: enabled, description: LLM proxy}
-  - {action: allow, protocol: udp, destination: "$GATEWAY/32", destination_port: "53", state: enabled, description: DNS}
-  - {action: allow, protocol: tcp, destination: "$GATEWAY/32", destination_port: "53", state: enabled, description: DNS}
-  - {action: drop, protocol: tcp, destination: "$GATEWAY/32", destination_port: "1-52,54-$((PROXY_PORT - 1)),$((PROXY_PORT + 1))-65535", state: enabled, description: rest of the host}
-  - {action: drop, protocol: udp, destination: "$GATEWAY/32", destination_port: "1-52,54-65535", state: enabled, description: rest of the host}
-  - {action: drop, destination: "10.0.0.0-10.77.0.0", state: enabled, description: private 10/8 below the bridge}
-  - {action: drop, destination: "10.77.0.2-10.255.255.255", state: enabled, description: private 10/8 above the gateway (other sandboxes, hermes)}
-  - {action: drop, destination: "172.16.0.0/12", state: enabled, description: private + docker}
-  - {action: drop, destination: "192.168.0.0/16", state: enabled, description: LAN}
-  - {action: drop, destination: "169.254.0.0/16", state: enabled, description: link-local and cloud metadata}
-  - {action: drop, destination: "100.64.0.0/10", state: enabled, description: CGNAT}
-  - {action: drop, destination: "127.0.0.0/8", state: enabled, description: loopback}
+  - {action: allow, protocol: tcp, destination: "$GATEWAY/32", destination_port: "$PROXY_PORT", state: enabled, description: "LLM proxy"}
+  - {action: allow, protocol: udp, destination: "$GATEWAY/32", destination_port: "53", state: enabled, description: "DNS"}
+  - {action: allow, protocol: tcp, destination: "$GATEWAY/32", destination_port: "53", state: enabled, description: "DNS"}
+  - {action: drop, protocol: tcp, destination: "$GATEWAY/32", destination_port: "1-52,54-$((PROXY_PORT - 1)),$((PROXY_PORT + 1))-65535", state: enabled, description: "rest of the host"}
+  - {action: drop, protocol: udp, destination: "$GATEWAY/32", destination_port: "1-52,54-65535", state: enabled, description: "rest of the host"}
+  - {action: drop, destination: "10.0.0.0-10.77.0.0", state: enabled, description: "private 10/8 below the bridge"}
+  - {action: drop, destination: "10.77.0.2-10.255.255.255", state: enabled, description: "private 10/8 above the gateway (other sandboxes, hermes)"}
+  - {action: drop, destination: "172.16.0.0/12", state: enabled, description: "private + docker"}
+  - {action: drop, destination: "192.168.0.0/16", state: enabled, description: "LAN"}
+  - {action: drop, destination: "169.254.0.0/16", state: enabled, description: "link-local and cloud metadata"}
+  - {action: drop, destination: "100.64.0.0/10", state: enabled, description: "CGNAT"}
+  - {action: drop, destination: "127.0.0.0/8", state: enabled, description: "loopback"}
 ingress: []
 YAML
 
@@ -67,14 +71,21 @@ exists incus project show "$PROJECT" || incus project create "$PROJECT" \
   -c restricted.containers.privilege=unprivileged -c restricted.containers.nesting=block \
   -c restricted.devices.nic=managed -c restricted.devices.disk=managed \
   -c restricted.networks.access="$NET" \
-  -c limits.instances=100 -c limits.memory=4GiB -c limits.cpu=4 -c limits.disk=18GiB
+  -c limits.instances=100 -c limits.disk=19GiB
+# No project-wide limits.memory / limits.cpu on purpose: Incus sums the *configured* limits of every
+# instance, stopped ones included, so they would cap how many sandboxes can exist (4 GiB = ~7) without
+# protecting the host. Real protection is the per-sandbox limits set at creation and
+# BALEBOT_AGENT_MAX_CONCURRENT. Disk is capped because the pool is a fixed-size file.
 incus profile device remove default root --project "$PROJECT" 2>/dev/null || true
 incus profile device remove default eth0 --project "$PROJECT" 2>/dev/null || true
 incus profile device add default root disk path=/ pool="$POOL" --project "$PROJECT"
+# The ACL is attached to the NETWORK, not to the instance NIC. Incus looks a NIC-level ACL up in the
+# instance's project, but the bridge and its ACL live in the default project, so a NIC-level ACL
+# fails with "Network ACL not found" for instances in project "$PROJECT".
+incus network set "$NET" security.acls="$ACL" \
+  security.acls.default.egress.action=allow security.acls.default.ingress.action=drop
 incus profile device add default eth0 nic network="$NET" name=eth0 \
-  security.port_isolation=true security.acls="$ACL" \
-  security.acls.default.egress.action=allow security.acls.default.ingress.action=drop \
-  --project "$PROJECT"
+  security.port_isolation=true --project "$PROJECT"
 
 echo "== 5. restricted client certificate for the bot"
 current=$(incus config get core.https_address || true)
@@ -102,6 +113,24 @@ remotes:
 aliases: {}
 YAML
 if id balebot >/dev/null 2>&1; then chown -R root:balebot "$CLIENT_DIR"; fi
+
+echo "== 6. host firewall (ufw)"
+# ufw drops inbound traffic by default, and it does so in a separate netfilter chain from the rules
+# Incus adds for its bridge, so DHCP/DNS from a new bridge are dropped unless ufw allows them too.
+# These are deliberately narrow: only what a sandbox needs from the host, not "allow all on $NET".
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+  ufw allow in on "$NET" to any port 67 proto udp comment "balebot sandbox DHCP"
+  ufw allow in on "$NET" to "$GATEWAY" port 53 proto udp comment "balebot sandbox DNS"
+  ufw allow in on "$NET" to "$GATEWAY" port 53 proto tcp comment "balebot sandbox DNS"
+  ufw allow in on "$NET" to "$GATEWAY" port "$PROXY_PORT" proto tcp comment "balebot LLM proxy"
+  # Forwarding: ufw's routed default is DROP. Allow sandboxes out through the uplink ONLY (not to
+  # docker0, incusbr0/hermes or other bridges). Replies come back through ufw's established/related rule.
+  UPLINK=${UPLINK:-$(ip -4 route show default | awk '{print $5; exit}')}
+  [ -n "$UPLINK" ] || { echo "cannot detect the uplink interface; set UPLINK=" >&2; exit 1; }
+  ufw route allow in on "$NET" out on "$UPLINK" comment "balebot sandbox internet"
+else
+  echo "ufw not active: nothing to do"
+fi
 
 echo "== checks"
 INCUS_CONF="$CLIENT_DIR" incus --project "$PROJECT" list >/dev/null && echo "ok: bot cert can use project $PROJECT"

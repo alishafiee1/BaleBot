@@ -5,6 +5,7 @@
 #
 #   PROBE_BLOCKED="10.179.96.162:22 192.168.10.196:22"  extra host:port pairs that must be unreachable
 set -uo pipefail
+exec </dev/null  # never let a wrapper's leftover stdin (e.g. a sudo password) reach incus
 
 PROJECT=${PROJECT:-balebot}
 IMAGE=${IMAGE:-agent-base}
