@@ -71,11 +71,13 @@ exists incus project show "$PROJECT" || incus project create "$PROJECT" \
   -c restricted.containers.privilege=unprivileged -c restricted.containers.nesting=block \
   -c restricted.devices.nic=managed -c restricted.devices.disk=managed \
   -c restricted.networks.access="$NET" \
-  -c limits.instances=100 -c limits.disk=19GiB
+  -c limits.instances=100
 # No project-wide limits.memory / limits.cpu on purpose: Incus sums the *configured* limits of every
 # instance, stopped ones included, so they would cap how many sandboxes can exist (4 GiB = ~7) without
 # protecting the host. Real protection is the per-sandbox limits set at creation and
-# BALEBOT_AGENT_MAX_CONCURRENT. Disk is capped because the pool is a fixed-size file.
+# BALEBOT_AGENT_MAX_CONCURRENT. No project-wide limits.disk either: it sums each sandbox's QUOTA
+# (template size + free space), but sandboxes are copy-on-write clones that share the template, so
+# real use is far smaller. The fixed-size pool file is the real cap: monitor it.
 incus profile device remove default root --project "$PROJECT" 2>/dev/null || true
 incus profile device remove default eth0 --project "$PROJECT" 2>/dev/null || true
 incus profile device add default root disk path=/ pool="$POOL" --project "$PROJECT"

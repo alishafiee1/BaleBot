@@ -35,8 +35,9 @@ class Settings(BaseSettings):
     sandbox_image: str = "agent-base"  # template instance the per-user sandboxes are copied from
     sandbox_cpu: int = 1
     sandbox_memory: str = "512MiB"
-    # needs a pool with quotas (btrfs/zfs), not `dir`; must equal the template's root size
-    sandbox_disk: str = "3GiB"
+    # per-sandbox root quota = measured template size + the free space each user should get.
+    # Needs a pool with quotas (btrfs/zfs), not `dir`. Set after building the template.
+    sandbox_disk: str = "5GiB"
     sandbox_processes: int = 256
     sandbox_idle_minutes: int = 30
     sandbox_destroy_days: int = 14

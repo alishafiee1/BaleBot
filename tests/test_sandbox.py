@@ -68,7 +68,7 @@ async def test_agent_runs_in_isolated_sandbox(agent_state, incus) -> None:
     assert {"limits.cpu=1", "limits.memory=512MiB", "limits.processes=256"} <= set(flags)
     assert {"security.privileged=false", "security.nesting=false"} <= set(flags)
     assert any(
-        c[:4] == ("config", "device", "override", "u1") and "size=3GiB" in c for c in incus.calls
+        c[:4] == ("config", "device", "override", "u1") and "size=5GiB" in c for c in incus.calls
     )
 
     # the task goes in as a file, never on a command line
