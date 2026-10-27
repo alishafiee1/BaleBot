@@ -150,3 +150,28 @@ def test_extract_models() -> None:
     assert extract_models(b'{"data":[{"id":"b"},{"id":"a"}]}') == ["a", "b"]
     assert extract_models(b'{"models":[{"name":"models/gemini"}]}') == ["gemini"]
     assert extract_models(b"garbage") == []
+
+
+async def test_request_fails_over_to_second_ip_on_timeout(
+    provider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def multi_resolve(host: str) -> list[str]:
+        return ["93.184.216.34", "93.184.216.35"]
+
+    monkeypatch.setattr(safe_http, "resolve_public", multi_resolve)
+    pins: list[tuple[str, str] | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pin = safe_http._pin.get()
+        pins.append(pin)
+        if pin and pin[1] == "93.184.216.34":
+            raise httpx.ReadTimeout("stalled first ip")
+        return provider.handler(request)
+
+    http = SafeHttp(transport=httpx.MockTransport(handler))
+    res = await http.request("GET", "https://api.example.com/")
+    assert res.status == 200
+    assert pins == [
+        ("api.example.com", "93.184.216.34"),
+        ("api.example.com", "93.184.216.35"),
+    ]

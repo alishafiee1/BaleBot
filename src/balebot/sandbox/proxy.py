@@ -2,13 +2,13 @@
 
 The Hermes agent inside a sandbox has no provider keys. It talks to this proxy with a
 short-lived token, and the proxy picks the user's model, adds the real key, and calls the
-provider. Even a fully compromised sandbox can therefore only make a bounded number of model
-calls as that one user; it can never read a key.
+upstream provider. Bind this app only to the Incus bridge address (e.g. 10.77.0.1:8001).
 """
 
+import asyncio
 import json
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -18,12 +18,11 @@ from balebot.models import User
 from balebot.net.safe_http import UnsafeURL
 from balebot.sandbox import tokens
 from balebot.services import runtime_settings
-from balebot.services.model_client import ModelError
+from balebot.services.model_client import ModelError, _zai_fallbacks
 from balebot.state import AppState
 
-MAX_BODY = 2_000_000
+MAX_BODY = 512_000
 MAX_TOKENS_CAP = 8192
-# only these OpenAI fields are forwarded; anything else the sandbox sends is dropped
 ALLOWED = {
     "messages",
     "tools",
@@ -41,52 +40,64 @@ def _error(status: int, message: str) -> JSONResponse:
     return JSONResponse({"error": {"message": message, "type": "proxy_error"}}, status_code=status)
 
 
-def to_sse(data: dict[str, Any]) -> Iterator[str]:
-    """Wrap a complete chat completion as an SSE stream (the upstream call is never streamed)."""
+async def to_sse(data: dict[str, Any]) -> AsyncIterator[bytes]:
+    """Turn a non-streaming chat completion into the SSE stream the OpenAI SDK expects."""
     choice = (data.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
-    delta: dict[str, Any] = {"role": "assistant"}
-    if msg.get("content"):
-        delta["content"] = msg["content"]
-    if msg.get("tool_calls"):
-        delta["tool_calls"] = [{"index": i, **tc} for i, tc in enumerate(msg["tool_calls"])]
     base = {
         "id": data.get("id", "chatcmpl-proxy"),
         "object": "chat.completion.chunk",
+        "created": data.get("created", int(time.time())),
         "model": data.get("model", "agent"),
     }
-    yield (
-        "data: "
-        + json.dumps({**base, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]})
-        + "\n\n"
-    )
-    final = {
+    content = msg.get("content")
+    reasoning = msg.get("reasoning_content")
+    text = content if (isinstance(content, str) and content.strip()) else reasoning
+    if isinstance(text, str) and text.strip():
+        chunk_text = {
+            **base,
+            "choices": [
+                {"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}
+            ],
+        }
+        yield f"data: {json.dumps(chunk_text)}\n\n".encode()
+    if msg.get("tool_calls"):
+        tcs = [{"index": i, **tc} for i, tc in enumerate(msg["tool_calls"]) if isinstance(tc, dict)]
+        chunk_tc = {
+            **base,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "tool_calls": tcs},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        yield f"data: {json.dumps(chunk_tc)}\n\n".encode()
+    finish_chunk: dict[str, Any] = {
         **base,
         "choices": [
             {"index": 0, "delta": {}, "finish_reason": choice.get("finish_reason", "stop")}
         ],
     }
-    if data.get("usage"):
-        final["usage"] = data["usage"]
-    yield "data: " + json.dumps(final) + "\n\n"
-    yield "data: [DONE]\n\n"
+    if "usage" in data:
+        finish_chunk["usage"] = data["usage"]
+    yield f"data: {json.dumps(finish_chunk)}\n\n".encode()
+    yield b"data: [DONE]\n\n"
 
 
 def create_proxy_app(state: AppState) -> FastAPI:
-    app = FastAPI(title="BaleBot LLM proxy", docs_url=None, redoc_url=None, openapi_url=None)
-    calls: dict[str, tuple[int, int]] = {}  # run_id -> (count, expires)
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    used: dict[str, tuple[int, int]] = {}  # run_id -> (count, expires)
 
     def bump(tok: tokens.AgentToken) -> int:
-        now = time.time()
-        for rid in [r for r, (_, exp) in calls.items() if exp < now]:
-            del calls[rid]
-        count = calls.get(tok.run_id, (0, tok.expires))[0] + 1
-        calls[tok.run_id] = (count, tok.expires)
-        return count
-
-    @app.get("/healthz")
-    async def healthz() -> dict[str, str]:
-        return {"status": "ok"}
+        now = int(time.time())
+        for k, (_, exp) in list(used.items()):
+            if exp < now:
+                used.pop(k, None)
+        count, _ = used.get(tok.run_id, (0, tok.expires))
+        used[tok.run_id] = (count + 1, tok.expires)
+        return count + 1
 
     @app.get("/v1/models")
     async def models() -> dict[str, Any]:
@@ -129,18 +140,51 @@ def create_proxy_app(state: AppState) -> FastAPI:
                 assert state.chat.keys is not None
                 data = await state.chat.keys.raw_chat(route, clean)
             else:
-                res = await state.http.request(
-                    "POST",
-                    cfg.base_url.rstrip("/") + "/chat/completions",
-                    headers={"Authorization": "Bearer " + state.settings.base_model_api_key},
-                    json={**clean, "model": cfg.base_model, "stream": False},
-                    timeout=180.0,
-                )
-                if res.status != 200:
-                    raise ModelError(f"http {res.status}")
-                data = json.loads(res.body)
+                url = cfg.base_url.rstrip("/") + "/chat/completions"
+                is_zai = "api.z.ai" in cfg.base_url
+                candidates = _zai_fallbacks(cfg.base_url, cfg.base_model)
+                res = None
+                parsed_data: dict[str, Any] | None = None
+                for idx, candidate in enumerate(candidates):
+                    if idx > 0 and is_zai:
+                        await asyncio.sleep(1.0 * idx)
+                    req_body: dict[str, Any] = {**clean, "model": candidate, "stream": False}
+                    if is_zai:
+                        req_body["thinking"] = {"type": "disabled"}
+                    try:
+                        res = await state.http.request(
+                            "POST",
+                            url,
+                            headers={
+                                "Authorization": "Bearer " + state.settings.base_model_api_key
+                            },
+                            json=req_body,
+                            timeout=45.0,
+                        )
+                    except UnsafeURL:
+                        if idx + 1 < len(candidates):
+                            continue
+                        raise
+                    if res.status == 200:
+                        try:
+                            loaded = json.loads(res.body)
+                        except ValueError:
+                            if idx + 1 < len(candidates):
+                                continue
+                            raise
+                        if isinstance(loaded, dict):
+                            parsed_data = loaded
+                            break
+                    if res.status not in (429, 500, 502, 503, 504) or idx + 1 >= len(candidates):
+                        break
+                if parsed_data is None:
+                    if res is not None and res.status != 200:
+                        return _error(502, f"upstream status {res.status}")
+                    return _error(502, "upstream model error")
+                data = parsed_data
         except (ModelError, UnsafeURL, ValueError):
-            return _error(502, "model call failed")
+            return _error(502, "upstream model error")
+
         if body.get("stream"):
             return StreamingResponse(to_sse(data), media_type="text/event-stream")
         return JSONResponse(data)

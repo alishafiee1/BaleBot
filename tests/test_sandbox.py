@@ -68,7 +68,7 @@ async def test_agent_runs_in_isolated_sandbox(agent_state, incus) -> None:
     assert {"limits.cpu=1", "limits.memory=512MiB", "limits.processes=256"} <= set(flags)
     assert {"security.privileged=false", "security.nesting=false"} <= set(flags)
     assert any(
-        c[:4] == ("config", "device", "override", "u1") and "size=5GiB" in c for c in incus.calls
+        c[:4] == ("config", "device", "override", "u1") and "size=3GiB" in c for c in incus.calls
     )
 
     # the task goes in as a file, never on a command line
@@ -287,3 +287,43 @@ async def test_proxy_validates_body(proxy, agent_state) -> None:
     assert (
         await proxy.post("/v1/chat/completions", json={"model": "x"}, headers=h)
     ).status_code == 400
+
+
+async def test_agent_menu_button_accepts_next_message_as_task(agent_state: AppState, incus) -> None:
+    cb = await agent_state.chat.handle_callback(1, "menu:agent")
+    assert cb is not None and cb.text == texts.AGENT_PROMPT
+    assert cb.keyboard == texts.CANCEL_KEYBOARD
+
+    reply = await agent_state.chat.handle_message(1, None, "یک اسکریپت تست اجرا کن")
+    assert reply.text == "agent says hi"
+    assert incus.pushed["u1/home/agent/in/query.txt"] == "یک اسکریپت تست اجرا کن".encode()
+
+
+async def test_proxy_retries_on_upstream_timeout_and_429(
+    agent_state: AppState, provider
+) -> None:
+    provider.extra_keys.add("test-key")
+    calls = 0
+    orig_handler = provider.handler
+
+    def flaky_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        if request.url.path.endswith("/chat/completions"):
+            calls += 1
+            if calls == 1:
+                raise httpx.ReadTimeout("first attempt timed out")
+            if calls == 2:
+                return httpx.Response(429, json={"error": {"message": "rate limit"}})
+        return orig_handler(request)
+
+    agent_state.http = __import__("balebot.net.safe_http", fromlist=["SafeHttp"]).SafeHttp(
+        transport=httpx.MockTransport(flaky_handler)
+    )
+    app = create_proxy_app(agent_state)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+    ) as c:
+        uid = await make_user(agent_state)
+        r = await c.post("/v1/chat/completions", json=BODY, headers=bearer(uid))
+        assert r.status_code == 200
+        assert calls == 3

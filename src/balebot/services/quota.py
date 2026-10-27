@@ -1,4 +1,5 @@
 from datetime import date
+from typing import Any
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -38,7 +39,7 @@ async def consume(
         )
         .values(count=UsageDaily.count + cost)
     )
-    return result.rowcount == 1  # type: ignore[attr-defined]
+    return bool(result.rowcount == 1)  # type: ignore[attr-defined]
 
 
 async def refund(session: AsyncSession, user_id: int, day: date, cost: int = 1) -> None:
@@ -50,7 +51,7 @@ async def refund(session: AsyncSession, user_id: int, day: date, cost: int = 1) 
     )
 
 
-def func_max0(expr):  # noqa: ANN001, ANN201
+def func_max0(expr: Any) -> Any:
     """max(expr, 0) in a way both SQLite and PostgreSQL accept."""
     from sqlalchemy import case
 

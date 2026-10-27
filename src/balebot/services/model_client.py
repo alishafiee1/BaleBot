@@ -1,4 +1,5 @@
-from typing import Protocol
+import asyncio
+from typing import Any, Protocol
 
 import httpx
 
@@ -13,29 +14,65 @@ class ModelClient(Protocol):
     ) -> str: ...
 
 
+def _extract_reply_text(data: dict[str, Any]) -> str:
+    msg = data["choices"][0]["message"]
+    content = msg.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    reasoning = msg.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning.strip():
+        return reasoning
+    return ""
+
+
+def _zai_fallbacks(base_url: str, model: str) -> list[str]:
+    if "api.z.ai" not in base_url:
+        return [model]
+    primary = "glm-4.7-flash" if model == "glm-4.5-flash" else model
+    return [primary, "glm-4.7-flash", "glm-4.7-flash", "glm-4.5-flash"]
+
+
 class OpenAICompatClient:
     """Any OpenAI-compatible /chat/completions endpoint (Z.ai, OpenAI, OpenRouter, ...)."""
 
-    def __init__(self, timeout: float = 120.0) -> None:
+    def __init__(self, timeout: float = 45.0) -> None:
         self._http = httpx.AsyncClient(timeout=timeout)
 
     async def chat(
         self, *, base_url: str, api_key: str, model: str, messages: list[dict[str, str]]
     ) -> str:
-        try:
-            resp = await self._http.post(
-                base_url.rstrip("/") + "/chat/completions",
-                headers={"Authorization": "Bearer " + api_key},
-                json={"model": model, "messages": messages},
-            )
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
-        except (httpx.HTTPError, KeyError, IndexError, ValueError) as exc:
-            # type only: the message/URL could carry a key
-            raise ModelError(type(exc).__name__) from None
-        if not content:
-            raise ModelError("empty reply")
-        return str(content)
+        url = base_url.rstrip("/") + "/chat/completions"
+        headers = {"Authorization": "Bearer " + api_key}
+        candidates = _zai_fallbacks(base_url, model)
+        is_zai = "api.z.ai" in base_url
+        last_exc: Exception | None = None
+        for idx, candidate in enumerate(candidates):
+            if idx > 0 and is_zai:
+                await asyncio.sleep(1.2 * idx)
+            try:
+                payload: dict[str, Any] = {"model": candidate, "messages": messages}
+                if is_zai:
+                    payload["thinking"] = {"type": "disabled"}
+                resp = await self._http.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                )
+                if resp.status_code in (429, 500, 502, 503, 504) and idx + 1 < len(candidates):
+                    continue
+                resp.raise_for_status()
+                content = _extract_reply_text(resp.json())
+            except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError) as exc:
+                last_exc = exc
+                if idx + 1 < len(candidates):
+                    continue
+                # type only: the message/URL could carry a key
+                raise ModelError(type(exc).__name__) from None
+            if content:
+                return str(content)
+        if last_exc is not None:
+            raise ModelError(type(last_exc).__name__) from None
+        raise ModelError("empty reply")
 
     async def aclose(self) -> None:
         await self._http.aclose()

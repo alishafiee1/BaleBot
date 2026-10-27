@@ -35,7 +35,7 @@ class HttpResult:
 
 def _public(ip: str) -> bool:
     addr = ipaddress.ip_address(ip)
-    if getattr(addr, "ipv4_mapped", None):
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
         addr = addr.ipv4_mapped  # ::ffff:127.0.0.1 must not slip through
     return addr.is_global and not addr.is_multicast
 
@@ -52,7 +52,7 @@ async def resolve_public(host: str) -> list[str]:
         infos = await loop.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
     except OSError:
         raise UnsafeURL("host does not resolve") from None
-    ips = sorted({str(i[4][0]) for i in infos})
+    ips = sorted({str(i[4][0]) for i in infos}, key=lambda ip: (":" in ip, ip))
     if not ips or not all(_public(ip) for ip in ips):
         raise UnsafeURL("host resolves to a non-public address")
     return ips
@@ -74,7 +74,7 @@ def check_url(url: str) -> tuple[str, str]:
 class _PinnedBackend(httpcore.AnyIOBackend):
     """Connects only to the address that passed the public-IP check for this request."""
 
-    async def connect_tcp(  # type: ignore[no-untyped-def,override]
+    async def connect_tcp(  # type: ignore[no-untyped-def]
         self, host, port, timeout=None, local_address=None, socket_options=None
     ):
         pin = _pin.get()
@@ -116,23 +116,27 @@ class SafeHttp:
         max_bytes: int = MAX_BODY,
     ) -> HttpResult:
         host, _ = check_url(url)
-        ip = (await resolve_public(host))[0]
-        token = _pin.set((host, ip))
-        try:
-            async with self._http.stream(
-                method, url, headers=headers, json=json, timeout=timeout
-            ) as resp:
-                body = bytearray()
-                async for chunk in resp.aiter_bytes():
-                    body += chunk
-                    if len(body) > max_bytes:
-                        raise UnsafeURL("response too large")
-                return HttpResult(resp.status_code, bytes(body))
-        except httpx.HTTPError as exc:
-            # type only: the message can contain the URL
-            raise UnsafeURL(f"request failed: {type(exc).__name__}") from None
-        finally:
-            _pin.reset(token)
+        ips = await resolve_public(host)
+        last_exc: httpx.HTTPError | None = None
+        for ip in ips[:3]:
+            token = _pin.set((host, ip))
+            try:
+                async with self._http.stream(
+                    method, url, headers=headers, json=json, timeout=timeout
+                ) as resp:
+                    body = bytearray()
+                    async for chunk in resp.aiter_bytes():
+                        body += chunk
+                        if len(body) > max_bytes:
+                            raise UnsafeURL("response too large")
+                    return HttpResult(resp.status_code, bytes(body))
+            except httpx.HTTPError as exc:
+                last_exc = exc
+            finally:
+                _pin.reset(token)
+        assert last_exc is not None
+        # type only: the message can contain the URL
+        raise UnsafeURL(f"request failed: {type(last_exc).__name__}") from None
 
     async def aclose(self) -> None:
         await self._http.aclose()

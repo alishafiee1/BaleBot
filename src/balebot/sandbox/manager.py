@@ -1,12 +1,7 @@
-"""Per-user sandboxes: one unprivileged Incus container per user, running Hermes one-shot.
+"""Per-user Incus sandboxes.
 
-What protects the host and the rest of the bot:
-- containers live in a restricted Incus project (no privileged mode, no host disk devices);
-- hard limits on CPU, memory, processes and disk, set at creation;
-- the agent runs as a non-root user and holds no provider keys (it only gets a short-lived
-  token for the LLM proxy);
-- the bot code and its secrets are never mounted into a sandbox;
-- idle sandboxes are stopped, old ones are destroyed.
+Each user gets at most one container (`u<user.id>`), cloned on first `/agent` use from the
+pre-built `agent-base` image. Idle containers are stopped; old ones are destroyed.
 """
 
 import asyncio
@@ -15,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from balebot.config import Settings
 from balebot.models import Sandbox, utcnow
@@ -24,11 +19,11 @@ from balebot.sandbox.incus import IncusRunner
 AGENT_UID = "1000"
 HOME = "/home/agent"
 QUERY_PATH = f"{HOME}/in/query.txt"
-OUTBOX = f"{HOME}/outbox"
-MAX_FILES = 5
-MAX_FILE_KB = 20_000
+OUTBOX = f"{HOME}/out"
 MAX_OUTPUT = 12_000
-FILE_NAME = re.compile(r"^[\w.\- ]{1,100}$")
+MAX_FILES = 5
+MAX_FILE_KB = 8_000
+FILE_NAME = re.compile(r"[A-Za-z0-9._\- ]{1,80}")
 
 
 class SandboxError(Exception):
@@ -49,7 +44,7 @@ def sandbox_name(user_id: int) -> str:
 
 class SandboxManager:
     def __init__(
-        self, settings: Settings, incus: IncusRunner, sessionmaker: async_sessionmaker
+        self, settings: Settings, incus: IncusRunner, sessionmaker: async_sessionmaker[AsyncSession]
     ) -> None:
         self._s = settings
         self._incus = incus
@@ -74,7 +69,17 @@ class SandboxManager:
         if not started.ok and "already running" not in started.err.lower():
             raise SandboxError("could not start sandbox")
         for _ in range(20):
-            if (await self._incus.run("exec", name, "--", "true", timeout=10)).ok:
+            if (
+                await self._incus.run(
+                    "exec",
+                    name,
+                    "--",
+                    "sh",
+                    "-c",
+                    "ip -4 route show default | grep -q default",
+                    timeout=10,
+                )
+            ).ok:
                 return name
             await asyncio.sleep(0.5)
         raise SandboxError("sandbox did not become ready")
@@ -152,7 +157,9 @@ class SandboxManager:
     def _as_agent(self, name: str, *cmd: str) -> tuple[str, ...]:
         return (
             "exec", name, "--user", AGENT_UID, "--group", AGENT_UID, "--cwd", HOME,
-            "--env", f"HOME={HOME}", "--", *cmd,
+            "--env", f"HOME={HOME}",
+            "--env", f"PATH={HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin",
+            "--", *cmd,
         )  # fmt: skip
 
     async def _run(self, name: str, prompt: str, token: str) -> AgentResult:
@@ -169,9 +176,9 @@ class SandboxManager:
             raise SandboxError("could not hand the task to the sandbox")
         cmd = [
             "timeout", "-k", "5", str(s.agent_timeout),
-            "hermes", "chat", "-Q", "--oneshot", "--query-file", QUERY_PATH,
+            "hermes", "chat", "--yolo", "-Q", "--oneshot", "--query-file", QUERY_PATH,
             "--provider", "custom", "--base-url", s.proxy_url, "--api-key", token,
-            "--max-turns", str(s.agent_max_turns), "--run-budget", str(s.agent_timeout),
+            "--model", "agent", "--max-turns", str(s.agent_max_turns),
             "--ignore-user-config",
         ]  # fmt: skip
         if s.agent_toolsets.strip():
@@ -179,6 +186,8 @@ class SandboxManager:
         res = await self._incus.run(*self._as_agent(name, *cmd), timeout=s.agent_timeout + 30)
         text = res.out.decode("utf-8", "replace").replace(token, "[redacted]").strip()
         timed_out = res.rc in (124, 137)
+        if timed_out:
+            await self._incus.run(*self._as_agent(name, "pkill", "-f", "hermes_cli"), timeout=5)
         files = await self._collect(name) if not timed_out else []
         return AgentResult(text[:MAX_OUTPUT], ok=res.ok, timed_out=timed_out, files=files)
 
@@ -186,7 +195,7 @@ class SandboxManager:
         listing = await self._incus.run(
             *self._as_agent(
                 name, "find", OUTBOX, "-maxdepth", "1", "-type", "f",
-                "-size", f"-{MAX_FILE_KB}k", "-printf", "%f\\n",
+                "-size", f"-{MAX_FILE_KB}k", "-printf", "%f\n",
             )
         )  # fmt: skip
         files: list[tuple[str, bytes]] = []

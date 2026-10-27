@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from balebot.config import Settings
 from balebot.gateway.bale import BaleApi
@@ -14,7 +14,7 @@ from balebot.services.model_client import ModelClient
 class AppState:
     settings: Settings
     engine: AsyncEngine
-    sessionmaker: async_sessionmaker
+    sessionmaker: async_sessionmaker[AsyncSession]
     model_client: ModelClient
     bale: BaleApi
     chat: ChatService

@@ -23,8 +23,9 @@ class Settings(BaseSettings):
     default_base_url: str = "https://api.z.ai/api/paas/v4"
     default_base_model: str = "glm-4.7-flash"
     default_system_prompt: str = (
-        "You are a helpful assistant in the Bale messenger. "
-        "Reply in the user's language (usually Persian)."
+        "تو یک دستیار هوشمند و کارآمد در پیام‌رسان ایرانی «بله» (Bale) هستی. "
+        "همیشه به زبان کاربر (معمولاً فارسی روان و محترمانه) پاسخ بده "
+        "و نام پیام‌رسان را همیشه «بله» بنویس (هرگز «بیل» ننویس)."
     )
     default_daily_quota: int = 100
 
@@ -35,9 +36,8 @@ class Settings(BaseSettings):
     sandbox_image: str = "agent-base"  # template instance the per-user sandboxes are copied from
     sandbox_cpu: int = 1
     sandbox_memory: str = "512MiB"
-    # per-sandbox root quota = measured template size + the free space each user should get.
-    # Needs a pool with quotas (btrfs/zfs), not `dir`. Set after building the template.
-    sandbox_disk: str = "5GiB"
+    # needs a pool with quotas (btrfs/zfs), not `dir`; must equal the template's root size
+    sandbox_disk: str = "3GiB"
     sandbox_processes: int = 256
     sandbox_idle_minutes: int = 30
     sandbox_destroy_days: int = 14
@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     agent_max_turns: int = 20
     agent_max_llm_calls: int = 40  # per run, enforced by the LLM proxy
     agent_max_concurrent: int = 3
-    agent_toolsets: str = ""  # comma list passed to hermes -t; empty = Hermes defaults
+    agent_toolsets: str = "terminal,file,web"  # comma list passed to hermes -t
     # secret that signs the short-lived tokens the sandbox uses to reach the LLM proxy
     proxy_secret: str = ""
     # how a sandbox reaches the proxy (bridge address of the sandbox network)

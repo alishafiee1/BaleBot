@@ -9,7 +9,7 @@ Group=balebot
 WorkingDirectory=/opt/balebot
 EnvironmentFile=/etc/balebot/env
 Environment=INCUS_CONF=/etc/balebot/incus
-ExecStart=/opt/balebot/.venv/bin/uvicorn balebot.main:app_factory --factory --host 127.0.0.1 --port 8000
+ExecStart=/opt/balebot/.venv/bin/uvicorn balebot.main:app_factory --factory --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=127.0.0.1,172.18.0.0/16
 Restart=on-failure
 RestartSec=5
 # hardening: the bot must not be able to change its own code or touch the rest of the system

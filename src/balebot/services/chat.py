@@ -1,5 +1,5 @@
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import delete, select
@@ -40,7 +40,7 @@ class ChatService:
         self,
         client: ModelClient,
         settings: Settings,
-        sessionmaker: async_sessionmaker,
+        sessionmaker: async_sessionmaker[AsyncSession],
         keys: KeyService | None = None,
     ) -> None:
         self._client = client
@@ -49,23 +49,58 @@ class ChatService:
         self.keys = keys
         self.sandbox: SandboxManager | None = None  # set by build_state when enabled
 
-    def _today(self):
+    def _today(self) -> date:
         return datetime.now(ZoneInfo(self._settings.timezone)).date()
 
     async def handle(self, bale_id: int, username: str | None, text: str) -> str:
         return (await self.handle_message(bale_id, username, text)).text
 
     async def handle_callback(self, bale_id: int, data: str) -> Reply | None:
-        if self.keys is None:
-            return None
+        day = self._today()
         async with self._sm() as s:
             user = await get_or_create_user(s, bale_id, None)
             cfg = await runtime_settings.load(s, self._settings)
+            limit = user.daily_quota if user.daily_quota is not None else cfg.daily_quota
             user_id, banned = user.id, user.banned
             await s.commit()
         if banned:
             return Reply(texts.BANNED)
-        return await self.keys.handle_callback(user_id, data, cfg)
+        kind, _, arg = data.partition(":")
+        if kind == "menu":
+            if self.keys is not None and arg != "addkey":
+                await self.keys._clear(user_id)
+            if arg == "main":
+                return Reply(texts.MENU_TEXT, texts.MAIN_MENU_KEYBOARD)
+            if arg == "help":
+                return Reply(texts.HELP, texts.MAIN_MENU_KEYBOARD)
+            if arg == "usage":
+                return Reply(
+                    await self._simple_command(user_id, "/usage", limit, day),
+                    texts.BACK_TO_MENU_KEYBOARD,
+                )
+            if arg == "new":
+                return Reply(
+                    await self._simple_command(user_id, "/new", limit, day),
+                    texts.BACK_TO_MENU_KEYBOARD,
+                )
+            if arg == "models" and self.keys is not None:
+                return await self.keys.models_page(user_id, cfg, 1)
+            if arg == "keys" and self.keys is not None:
+                return await self.keys._list_keys(user_id)
+            if arg == "addkey" and self.keys is not None:
+                return await self.keys.start_addkey(user_id)
+            if arg == "agent":
+                if self.sandbox is None or not self._settings.sandbox_enabled:
+                    return Reply(texts.AGENT_OFF, texts.BACK_TO_MENU_KEYBOARD)
+                if self.keys is not None:
+                    return await self.keys.start_agent_prompt(user_id)
+                return Reply(texts.AGENT_PROMPT, texts.BACK_TO_MENU_KEYBOARD)
+            if arg == "cancel":
+                return Reply(texts.CANCELLED, texts.MAIN_MENU_KEYBOARD)
+            return Reply(texts.MENU_TEXT, texts.MAIN_MENU_KEYBOARD)
+        if self.keys is None:
+            return None
+        return await self.keys.handle_callback(user_id, data, cfg, limit=limit, day=day)
 
     async def handle_message(
         self,
@@ -99,17 +134,25 @@ class ChatService:
 
         if cmd == "/agent":
             return await self._agent(user_id, selected, text, limit, day, progress)
+        if cmd in ("/help", "/guide"):
+            return Reply(texts.HELP, texts.MAIN_MENU_KEYBOARD)
+        if cmd == "/menu":
+            return Reply(texts.MENU_TEXT, texts.MAIN_MENU_KEYBOARD)
         if cmd in ("/start", "/usage", "/new"):
-            return Reply(await self._simple_command(user_id, cmd, limit, day))
+            kb = texts.MAIN_MENU_KEYBOARD if cmd == "/start" else texts.BACK_TO_MENU_KEYBOARD
+            return Reply(await self._simple_command(user_id, cmd, limit, day), kb)
         if not text:
             return Reply(texts.UNSUPPORTED)
+
+        if self.keys is not None and await self.keys.pop_agent_pending(user_id):
+            return await self._agent(user_id, selected, f"/agent {text}", limit, day, progress)
 
         route = await self.keys.resolve(user_id, selected) if self.keys else None
         if route is None:  # free base model: counts against the daily quota
             async with self._sm() as s:
                 if not await quota.consume(s, user_id, day, limit):
                     await s.commit()
-                    return Reply(texts.QUOTA_EXHAUSTED)
+                    return Reply(texts.QUOTA_EXHAUSTED, texts.MAIN_MENU_KEYBOARD)
                 await s.commit()
         async with self._sm() as s:
             history = await self._history(s, user_id)
@@ -122,9 +165,9 @@ class ChatService:
         try:
             if route is not None:
                 assert self.keys is not None
-                reply = await self.keys.chat(route, messages)
+                reply_text = await self.keys.chat(route, messages)
             else:
-                reply = await self._client.chat(
+                reply_text = await self._client.chat(
                     base_url=cfg.base_url,
                     api_key=self._settings.base_model_api_key,
                     model=cfg.base_model,
@@ -139,9 +182,9 @@ class ChatService:
 
         async with self._sm() as s:
             s.add(Message(user_id=user_id, role="user", content=text))
-            s.add(Message(user_id=user_id, role="assistant", content=reply))
+            s.add(Message(user_id=user_id, role="assistant", content=reply_text))
             await s.commit()
-        return Reply(reply)
+        return Reply(reply_text)
 
     async def _agent(
         self,
@@ -149,7 +192,7 @@ class ChatService:
         selected: str | None,
         text: str,
         limit: int,
-        day,
+        day: date,
         progress: Callable[[str], Awaitable[None]] | None,
     ) -> Reply:
         """Run a task with Hermes tools inside the user's sandbox."""
@@ -193,7 +236,7 @@ class ChatService:
             text_out = f"{text_out}\n\n{texts.AGENT_TIMEOUT}"
         return Reply(text_out, files=result.files)
 
-    async def _simple_command(self, user_id: int, cmd: str, limit: int, day) -> str:
+    async def _simple_command(self, user_id: int, cmd: str, limit: int, day: date) -> str:
         async with self._sm() as s:
             if cmd == "/new":
                 user = await s.get(User, user_id)

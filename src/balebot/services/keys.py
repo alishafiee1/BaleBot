@@ -64,7 +64,7 @@ class KeyService:
     def __init__(
         self,
         settings: Settings,
-        sessionmaker: async_sessionmaker,
+        sessionmaker: async_sessionmaker[AsyncSession],
         vault: Vault | None,
         http: SafeHttp,
         model_client: ModelClient,
@@ -130,8 +130,9 @@ class KeyService:
     async def chat(self, route: Route, messages: list[dict[str, str]]) -> str:
         data = await self.raw_chat(route, {"messages": messages})
         try:
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError):
+            msg = data["choices"][0]["message"]
+            content = msg.get("content") or msg.get("reasoning_content")
+        except (KeyError, IndexError, TypeError, AttributeError):
             raise ModelError("bad reply") from None
         if not content:
             raise ModelError("empty")
@@ -161,6 +162,25 @@ class KeyService:
             await s.execute(delete(PendingAction).where(PendingAction.user_id == user_id))
             await s.commit()
 
+    async def start_addkey(self, user_id: int) -> Reply:
+        if self._vault is None:
+            return Reply(texts.KEYS_OFF, texts.BACK_TO_MENU_KEYBOARD)
+        await self._set_pending(user_id, "site", {})
+        return Reply(texts.ASK_SITE, texts.SITE_PICK_KEYBOARD)
+
+    async def start_agent_prompt(self, user_id: int) -> Reply:
+        await self._set_pending(user_id, "agent_task", {})
+        return Reply(texts.AGENT_PROMPT, texts.CANCEL_KEYBOARD)
+
+    async def pop_agent_pending(self, user_id: int) -> bool:
+        async with self._sm() as s:
+            pending = await self._pending(s, user_id)
+            if pending is not None and pending.step == "agent_task":
+                await s.delete(pending)
+                await s.commit()
+                return True
+        return False
+
     # ---- entry points --------------------------------------------------------------------
     @staticmethod
     def wants_keys(cmd: str, text: str) -> bool:
@@ -180,36 +200,61 @@ class KeyService:
         """A Reply when this message belongs to the key features, None to chat normally."""
         if cmd == "/cancel":
             await self._clear(user_id)
-            return Reply(texts.CANCELLED)
+            return Reply(texts.CANCELLED, texts.MAIN_MENU_KEYBOARD)
         async with self._sm() as s:
             pending = await self._pending(s, user_id)
         if cmd == "/addkey" or (not cmd and pending is None and self.wants_keys("", text)):
-            if self._vault is None:
-                return Reply(texts.KEYS_OFF)
-            await self._set_pending(user_id, "site", {})
-            return Reply(texts.ASK_SITE)
+            return await self.start_addkey(user_id)
         if cmd == "/keys":
+            await self._clear(user_id)
             return await self._list_keys(user_id)
         if cmd == "/delkey":
+            await self._clear(user_id)
             return await self._del_key(user_id, text)
         if cmd == "/addmodel":
+            await self._clear(user_id)
             return await self._add_model(user_id, text)
         if cmd in ("/models", "/model"):
+            await self._clear(user_id)
             parts = text.split()
             num = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
             if cmd == "/models":
                 return await self.models_page(user_id, cfg, num or 1)
             return await self._pick_number(user_id, cfg, num or 0)
-        if cmd or pending is None:
+        if cmd:
+            await self._clear(user_id)
+            return None
+        if pending is None or pending.step == "agent_task":
             return None
         return await self._advance(user_id, pending, text, cfg, limit, day, delete_incoming)
 
-    async def handle_callback(self, user_id: int, data: str, cfg: RuntimeConfig) -> Reply | None:
+    async def handle_callback(
+        self,
+        user_id: int,
+        data: str,
+        cfg: RuntimeConfig,
+        *,
+        limit: int = 20,
+        day: date | None = None,
+    ) -> Reply | None:
         kind, _, arg = data.partition(":")
         if kind == "page" and arg.isdigit():
             return await self.models_page(user_id, cfg, int(arg))
         if kind == "pick":
             return await self._pick_token(user_id, cfg, arg)
+        if kind == "site" and arg:
+            return await self._step_site(user_id, arg, cfg, limit, day or date.today())
+        if kind == "confirm":
+            async with self._sm() as s:
+                pending = await self._pending(s, user_id)
+            if pending is None or pending.step != "confirm":
+                return Reply(texts.CANCELLED, texts.MAIN_MENU_KEYBOARD)
+            pdata = json.loads(pending.data)
+            if arg == "yes":
+                await self._set_pending(user_id, "key", pdata)
+                return Reply(texts.ASK_KEY, texts.CANCEL_KEYBOARD)
+            await self._clear(user_id)
+            return Reply(texts.CANCELLED, texts.MAIN_MENU_KEYBOARD)
         return None
 
     # ---- add-key steps -------------------------------------------------------------------
@@ -231,11 +276,14 @@ class KeyService:
             word = text.strip().lower()
             if word in YES:
                 await self._set_pending(user_id, "key", data)
-                return Reply(texts.ASK_KEY)
+                return Reply(texts.ASK_KEY, texts.CANCEL_KEYBOARD)
             if word in NO:
                 await self._clear(user_id)
-                return Reply(texts.CANCELLED)
-            return Reply(texts.CONFIRM.format(name=provider.name, host=provider.host))
+                return Reply(texts.CANCELLED, texts.MAIN_MENU_KEYBOARD)
+            return Reply(
+                texts.CONFIRM.format(name=provider.name, host=provider.host),
+                texts.CONFIRM_KEYBOARD,
+            )
         return await self._step_key(user_id, provider, text, delete_incoming)
 
     async def _step_site(
@@ -245,15 +293,18 @@ class KeyService:
         if provider is None:
             site = parse_site(text)
             if site is None:
-                return Reply(texts.SITE_UNKNOWN)
+                return Reply(texts.SITE_UNKNOWN, texts.SITE_PICK_KEYBOARD)
             try:
                 provider = await self._generate(user_id, site, cfg, limit, day)
             except QuotaExhausted:
-                return Reply(texts.QUOTA_EXHAUSTED)
+                return Reply(texts.QUOTA_EXHAUSTED, texts.BACK_TO_MENU_KEYBOARD)
             if provider is None:
-                return Reply(texts.AI_FAILED)
+                return Reply(texts.AI_FAILED, texts.SITE_PICK_KEYBOARD)
         await self._set_pending(user_id, "confirm", {"cfg": provider.model_dump()})
-        return Reply(texts.CONFIRM.format(name=provider.name, host=provider.host))
+        return Reply(
+            texts.CONFIRM.format(name=provider.name, host=provider.host),
+            texts.CONFIRM_KEYBOARD,
+        )
 
     async def _generate(
         self, user_id: int, site: str, cfg: RuntimeConfig, limit: int, day: date
@@ -291,9 +342,9 @@ class KeyService:
             await delete_incoming()
         key = text.strip()
         if self._vault is None:
-            return Reply(texts.KEYS_OFF)
+            return Reply(texts.KEYS_OFF, texts.BACK_TO_MENU_KEYBOARD)
         if not KEY_RE.fullmatch(key):
-            return Reply(texts.KEY_BAD_FORMAT)
+            return Reply(texts.KEY_BAD_FORMAT, texts.CANCEL_KEYBOARD)
         models: list[str] = []
         if provider.models_path:
             try:
@@ -303,15 +354,18 @@ class KeyService:
                     headers=build_headers(provider, key),
                 )
             except UnsafeURL:
-                return Reply(texts.KEY_PROBE_FAILED)
+                return Reply(texts.KEY_PROBE_FAILED, texts.CANCEL_KEYBOARD)
             if res.status in (401, 403):
-                return Reply(texts.KEY_REJECTED)
+                return Reply(texts.KEY_REJECTED, texts.CANCEL_KEYBOARD)
             if res.status == 200:
                 models = extract_models(res.body)
         async with self._sm() as s:
             count = await s.scalar(select(func.count(UserKey.id)).where(UserKey.user_id == user_id))
             if (count or 0) >= MAX_KEYS:
-                return Reply(f"حداکثر {MAX_KEYS} کلید می‌توانید داشته باشید. /keys")
+                return Reply(
+                    f"حداکثر {MAX_KEYS} کلید می‌توانید داشته باشید. /keys",
+                    texts.KEYS_ACTION_KEYBOARD,
+                )
             row = UserKey(
                 user_id=user_id,
                 name=provider.name,
@@ -331,8 +385,14 @@ class KeyService:
             await s.commit()
             key_id = row.id
         if models:
-            return Reply(texts.KEY_SAVED.format(name=provider.name, count=len(models)))
-        return Reply(texts.KEY_SAVED_NO_MODELS.format(name=provider.name, id=key_id))
+            return Reply(
+                texts.KEY_SAVED.format(name=provider.name, count=len(models)),
+                texts.KEYS_ACTION_KEYBOARD,
+            )
+        return Reply(
+            texts.KEY_SAVED_NO_MODELS.format(name=provider.name, id=key_id),
+            texts.KEYS_ACTION_KEYBOARD,
+        )
 
     # ---- key management ------------------------------------------------------------------
     async def _list_keys(self, user_id: int) -> Reply:
@@ -349,21 +409,21 @@ class KeyService:
             )
             counts = {kid: n for kid, n in counted.all()}
         if not keys:
-            return Reply(texts.NO_KEYS)
+            return Reply(texts.NO_KEYS, texts.KEYS_ACTION_KEYBOARD)
         lines = [texts.KEYS_HEADER] + [
             f"{k.id}. {k.name} — ••••{k.last4} — {counts.get(k.id, 0)} مدل  (حذف: /delkey {k.id})"
             for k in keys
         ]
-        return Reply("\n".join(lines))
+        return Reply("\n".join(lines), texts.KEYS_ACTION_KEYBOARD)
 
     async def _del_key(self, user_id: int, text: str) -> Reply:
         parts = text.split()
         if len(parts) < 2 or not parts[1].isdigit():
-            return Reply(texts.KEY_NOT_FOUND)
+            return Reply(texts.KEY_NOT_FOUND, texts.KEYS_ACTION_KEYBOARD)
         async with self._sm() as s:
             key = await s.get(UserKey, int(parts[1]))
             if key is None or key.user_id != user_id:
-                return Reply(texts.KEY_NOT_FOUND)
+                return Reply(texts.KEY_NOT_FOUND, texts.KEYS_ACTION_KEYBOARD)
             await s.execute(delete(UserModel).where(UserModel.key_id == key.id))
             await s.delete(key)
             user = await s.get(User, user_id)
@@ -376,19 +436,19 @@ class KeyService:
             ):
                 user.selected_model = None
             await s.commit()
-        return Reply(texts.KEY_DELETED)
+        return Reply(texts.KEY_DELETED, texts.KEYS_ACTION_KEYBOARD)
 
     async def _add_model(self, user_id: int, text: str) -> Reply:
         parts = text.split()
         if len(parts) != 3 or not parts[1].isdigit() or not MODEL_RE.fullmatch(parts[2]):
-            return Reply(texts.ADDMODEL_USAGE)
+            return Reply(texts.ADDMODEL_USAGE, texts.BACK_TO_MENU_KEYBOARD)
         async with self._sm() as s:
             key = await s.get(UserKey, int(parts[1]))
             if key is None or key.user_id != user_id:
-                return Reply(texts.KEY_NOT_FOUND)
+                return Reply(texts.KEY_NOT_FOUND, texts.KEYS_ACTION_KEYBOARD)
             s.add(UserModel(user_id=user_id, key_id=key.id, model=parts[2]))
             await s.commit()
-        return Reply(texts.MODEL_ADDED)
+        return Reply(texts.MODEL_ADDED, texts.KEYS_ACTION_KEYBOARD)
 
     # ---- model menu ----------------------------------------------------------------------
     async def _options(
@@ -436,13 +496,19 @@ class KeyService:
                     {"text": "▶", "callback_data": f"page:{min(page + 1, pages)}"},
                 ]
             )
+        keyboard.append(
+            [
+                {"text": "🔑 افزودن کلید API", "callback_data": "menu:addkey"},
+                {"text": "📋 منوی اصلی", "callback_data": "menu:main"},
+            ]
+        )
         return Reply("\n".join(lines), keyboard)
 
     async def _pick_number(self, user_id: int, cfg: RuntimeConfig, number: int) -> Reply:
         async with self._sm() as s:
             opts = await self._options(s, user_id, cfg)
         if not 1 <= number <= len(opts):
-            return Reply(texts.MODEL_BAD)
+            return Reply(texts.MODEL_BAD, texts.BACK_TO_MENU_KEYBOARD)
         return await self._pick_token(user_id, cfg, opts[number - 1][0])
 
     async def _pick_token(self, user_id: int, cfg: RuntimeConfig, token: str) -> Reply:
@@ -450,9 +516,9 @@ class KeyService:
             # only this user's own options can match, whatever the callback data says
             label = dict(await self._options(s, user_id, cfg)).get(token)
             if label is None:
-                return Reply(texts.MODEL_BAD)
+                return Reply(texts.MODEL_BAD, texts.BACK_TO_MENU_KEYBOARD)
             user = await s.get(User, user_id)
             assert user is not None
             user.selected_model = None if token == "base" else token
             await s.commit()
-        return Reply(texts.MODEL_SET.format(label=label))
+        return Reply(texts.MODEL_SET.format(label=label), texts.BACK_TO_MENU_KEYBOARD)

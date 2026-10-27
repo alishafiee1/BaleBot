@@ -75,3 +75,42 @@ async def test_purge_removes_only_old_messages(state: AppState) -> None:
         await s.commit()
         left = (await s.scalars(select(Message.content))).all()
     assert "old" not in left and "recent" in left
+
+
+async def test_help_and_menu_commands_and_callbacks(state: AppState, model) -> None:
+    start_reply = await state.chat.handle_message(1, "ali", "/start")
+    assert "سلام" in start_reply.text
+    assert start_reply.keyboard == texts.MAIN_MENU_KEYBOARD
+
+    menu_reply = await state.chat.handle_message(1, "ali", "/menu")
+    assert menu_reply.text == texts.MENU_TEXT
+    assert menu_reply.keyboard == texts.MAIN_MENU_KEYBOARD
+
+    help_reply = await state.chat.handle_message(1, "ali", "/help")
+    assert help_reply.text == texts.HELP
+    assert help_reply.keyboard == texts.MAIN_MENU_KEYBOARD
+
+    cb_help = await state.chat.handle_callback(1, "menu:help")
+    assert cb_help is not None and cb_help.text == texts.HELP
+
+    cb_usage = await state.chat.handle_callback(1, "menu:usage")
+    assert cb_usage is not None and "مصرف امروز" in cb_usage.text
+
+    cb_new = await state.chat.handle_callback(1, "menu:new")
+    assert cb_new is not None and cb_new.text == texts.NEW_CHAT
+
+    cb_models = await state.chat.handle_callback(1, "menu:models")
+    assert cb_models is not None and texts.MODELS_HEADER in cb_models.text
+
+    cb_keys = await state.chat.handle_callback(1, "menu:keys")
+    assert cb_keys is not None and cb_keys.text == texts.NO_KEYS
+
+    # Test menu:addkey starts addkey flow, and normal command or menu:cancel clears pending_actions
+    cb_addkey = await state.chat.handle_callback(1, "menu:addkey")
+    assert cb_addkey is not None and cb_addkey.text == texts.ASK_SITE
+    assert cb_addkey.keyboard == texts.SITE_PICK_KEYBOARD
+
+    # Sending /start clears pending addkey state so normal chat works
+    await state.chat.handle_message(1, "ali", "/start")
+    chat_reply = await state.chat.handle_message(1, "ali", "سلام خوبی؟")
+    assert chat_reply.text.startswith("echo:")

@@ -20,7 +20,7 @@ trap cleanup EXIT
 cleanup
 incus copy "$IMAGE" "$PROBE" --project "$PROJECT" -c limits.memory=256MiB -c limits.cpu=1 || exit 1
 incus start "$PROBE" --project "$PROJECT" || exit 1
-for _ in $(seq 1 30); do incus exec "$PROBE" --project "$PROJECT" -- true 2>/dev/null && break; sleep 1; done
+for _ in $(seq 1 30); do incus exec "$PROBE" --project "$PROJECT" -- ip -4 route show default 2>/dev/null | grep -q default && break; sleep 1; done
 
 agent() { incus exec "$PROBE" --project "$PROJECT" --user 1000 --group 1000 --cwd /home/agent -- "$@"; }
 tcp() { agent timeout 4 bash -c 'exec 3<>/dev/tcp/$0/$1' "$1" "$2" 2>/dev/null; }
