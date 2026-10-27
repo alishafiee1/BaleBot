@@ -299,9 +299,7 @@ async def test_agent_menu_button_accepts_next_message_as_task(agent_state: AppSt
     assert incus.pushed["u1/home/agent/in/query.txt"] == "یک اسکریپت تست اجرا کن".encode()
 
 
-async def test_proxy_retries_on_upstream_timeout_and_429(
-    agent_state: AppState, provider
-) -> None:
+async def test_proxy_retries_on_upstream_timeout_and_429(agent_state: AppState, provider) -> None:
     provider.extra_keys.add("test-key")
     calls = 0
     orig_handler = provider.handler
@@ -348,17 +346,21 @@ async def test_unified_hermes_and_multiturn_history_reset(agent_state, incus) ->
         assert rows[0].role == "user" and rows[0].content == "سلام هرمس"
         assert rows[1].role == "assistant" and rows[1].content == "agent says hi"
 
+    # Second turn before /new includes history in query.txt
+    await agent_state.chat.handle_message(1, None, "پیام دوم")
+    pushed_before_reset = incus.pushed["u1/home/agent/in/query.txt"].decode()
+    assert "سلام هرمس" in pushed_before_reset and "پیام دوم" in pushed_before_reset
+
     await agent_state.chat.handle_message(1, None, "/new")
     async with agent_state.sessionmaker() as s:
         user_after = await s.get(User, user.id)
         assert user_after is not None and user_after.context_reset_at is not None
-        reset_ts = int(user_after.context_reset_at.timestamp())
 
     incus.calls.clear()
-    await agent_state.chat.handle_message(1, None, "پیام دوم")
+    await agent_state.chat.handle_message(1, None, "پیام پس از ریست")
     call = incus.hermes_call()
-    assert "--continue" in call
-    assert call[call.index("--continue") + 1] == f"bale-{reset_ts}"
+    assert "--continue" not in call
+    assert incus.pushed["u1/home/agent/in/query.txt"] == "پیام پس از ریست".encode()
 
 
 async def test_ensure_skips_start_when_already_running(agent_state, incus) -> None:
@@ -415,3 +417,10 @@ async def test_proxy_web_search_returns_results(proxy, agent_state, provider) ->
     assert data["ok"] is True
     assert data["query"] == "اخبار ایران"
 
+
+async def test_unified_hermes_falls_back_on_worker_unknown_output(agent_state, incus) -> None:
+    incus.agent_output = "Worker execution is unknown."
+    reply = await agent_state.chat.handle_message(1, None, "بگو چی هستی و چه کارا میتونی بکنی؟")
+    assert "Worker execution is unknown" not in reply.text
+    assert reply.text != texts.AGENT_FAILED
+    assert "echo:" in reply.text

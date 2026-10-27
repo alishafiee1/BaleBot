@@ -149,6 +149,14 @@ class SandboxManager:
                 await self.destroy(row.user_id)
                 destroyed += 1
             elif row.last_used < idle:
+                cron = await self._incus.run(
+                    "exec", sandbox_name(row.user_id), "--", "crontab", "-u", "agent", "-l"
+                )
+                if cron.ok and any(
+                    ln.strip() and not ln.strip().startswith("#")
+                    for ln in cron.out.decode("utf-8", "ignore").splitlines()
+                ):
+                    continue
                 if (await self._incus.run("stop", sandbox_name(row.user_id), "--timeout", "10")).ok:
                     stopped += 1
         return stopped, destroyed
@@ -204,13 +212,19 @@ class SandboxManager:
     ) -> AgentResult:
         s = self._s
         user_token = (
-            tokens.issue_user_token(s.proxy_secret, user_id)
-            if len(s.proxy_secret) >= 16
-            else token
+            tokens.issue_user_token(s.proxy_secret, user_id) if len(s.proxy_secret) >= 16 else token
         )
 
         # the prompt travels as a file, never on a command line
-        await self._incus.run(*self._as_agent(name, "rm", "-rf", OUTBOX, f"{HOME}/in"))
+        await self._incus.run(
+            *self._as_agent(
+                name,
+                "rm",
+                "-rf",
+                OUTBOX,
+                f"{HOME}/in",
+            )
+        )
         await self._incus.run(
             *self._as_agent(
                 name,
@@ -323,7 +337,6 @@ class SandboxManager:
             "--provider", "custom", "--base-url", s.proxy_url, "--api-key", token,
             "--model", "balebot", "--max-turns", str(s.agent_max_turns),
             "--ignore-user-config",
-            "--continue", session_name, "--create-if-missing",
         ]  # fmt: skip
         if s.agent_toolsets.strip():
             cmd += ["-t", s.agent_toolsets.strip()]
@@ -355,11 +368,20 @@ class SandboxManager:
             .replace(user_token, "[redacted]")
             .strip()
         )
+        bad_markers = (
+            "Worker execution is unknown",
+            "Execution outcome is unknown",
+            "Unknown execution blocks this session",
+        )
+        has_bad_marker = any(m in text for m in bad_markers)
+        if has_bad_marker:
+            text = ""
+        ok = res.ok and not has_bad_marker
         timed_out = res.rc in (124, 137)
         if timed_out:
             await self._incus.run(*self._as_agent(name, "pkill", "-f", "hermes_cli"), timeout=5)
         files = await self._collect(name) if not timed_out else []
-        return AgentResult(text[:MAX_OUTPUT], ok=res.ok, timed_out=timed_out, files=files)
+        return AgentResult(text[:MAX_OUTPUT], ok=ok, timed_out=timed_out, files=files)
 
     async def _collect(self, name: str) -> list[tuple[str, bytes]]:
         listing = await self._incus.run(

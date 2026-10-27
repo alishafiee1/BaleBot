@@ -214,9 +214,11 @@ class ChatService:
             and self._settings.unified_hermes
             and len(self._settings.proxy_secret) >= 16
         ):
-            return await self._agent(
+            agent_reply = await self._agent(
                 user_id, selected, f"/agent {text}", limit, day, progress, on_stage=on_stage
             )
+            if agent_reply.text not in (texts.AGENT_FAILED, texts.AGENT_EMPTY):
+                return agent_reply
 
         route = await self.keys.resolve(user_id, selected) if self.keys else None
         if route is None:  # free base model: counts against the daily quota
@@ -296,6 +298,16 @@ class ChatService:
                 if user and user.context_reset_at
                 else "bale"
             )
+            history = await self._history(db, user_id)
+
+        prompt_for_agent = task
+        if history:
+            lines = ["[سابقهٔ گفتگوی اخیر با کاربر — برای حفظ زمینهٔ مکالمه:]"]
+            for m in history[-10:]:
+                role_label = "کاربر" if m["role"] == "user" else "دستیار"
+                lines.append(f"{role_label}: {m['content']}")
+            lines.append(f"\n[پیام جدید کاربر که باید الان به آن پاسخ دهی:]\n{task}")
+            prompt_for_agent = "\n".join(lines)
 
         if progress:
             await progress(texts.AGENT_RUNNING)
@@ -305,7 +317,7 @@ class ChatService:
         try:
             result = await self.sandbox.run_agent(
                 user_id,
-                task,
+                prompt_for_agent,
                 token=token,
                 session_name=session_name,
                 on_stage=on_stage,
