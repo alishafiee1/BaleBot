@@ -6,14 +6,17 @@ pre-built `agent-base` image. Idle containers are stopped; old ones are destroye
 
 import asyncio
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from balebot import texts
 from balebot.config import Settings
 from balebot.models import Sandbox, utcnow
+from balebot.sandbox import tokens
 from balebot.sandbox.incus import IncusRunner
 
 AGENT_UID = "1000"
@@ -59,16 +62,25 @@ class SandboxManager:
     # ---- lifecycle ---------------------------------------------------------------------
     async def ensure(self, user_id: int) -> str:
         name = sandbox_name(user_id)
-        if not (await self._incus.run("info", name)).ok:
+        info = await self._incus.run("info", name)
+        if not info.ok:
             await self._create(name)
             async with self._sm() as s:
                 if await s.get(Sandbox, user_id) is None:
                     s.add(Sandbox(user_id=user_id))
                     await s.commit()
+        elif b"status: running" in info.out.lower():
+            async with self._sm() as s:
+                row = await s.get(Sandbox, user_id)
+                if row:
+                    row.last_used = utcnow()
+                    await s.commit()
+            return name
+
         started = await self._incus.run("start", name)
         if not started.ok and "already running" not in started.err.lower():
             raise SandboxError("could not start sandbox")
-        for _ in range(20):
+        for _ in range(40):
             if (
                 await self._incus.run(
                     "exec",
@@ -81,7 +93,7 @@ class SandboxManager:
                 )
             ).ok:
                 return name
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.15)
         raise SandboxError("sandbox did not become ready")
 
     async def _create(self, name: str) -> None:
@@ -141,12 +153,29 @@ class SandboxManager:
         return stopped, destroyed
 
     # ---- running the agent ------------------------------------------------------------------
-    async def run_agent(self, user_id: int, prompt: str, *, token: str) -> AgentResult:
+    async def run_agent(
+        self,
+        user_id: int,
+        prompt: str,
+        *,
+        token: str,
+        session_name: str = "bale",
+        on_stage: Callable[[str], Awaitable[None]] | None = None,
+    ) -> AgentResult:
         lock = self._locks.setdefault(user_id, asyncio.Lock())
         async with lock, self._slots:
+            if on_stage:
+                await on_stage("🔄 مرحله ۱ از ۳: آمادهسازی محیط اختصاصی لینوکس هرمس...")
             name = await self.ensure(user_id)
             try:
-                return await self._run(name, prompt, token)
+                return await self._run(
+                    name,
+                    prompt,
+                    token,
+                    user_id=user_id,
+                    session_name=session_name,
+                    on_stage=on_stage,
+                )
             finally:
                 async with self._sm() as s:
                     row = await s.get(Sandbox, user_id)
@@ -162,13 +191,40 @@ class SandboxManager:
             "--", *cmd,
         )  # fmt: skip
 
-    async def _run(self, name: str, prompt: str, token: str) -> AgentResult:
+    async def _run(
+        self,
+        name: str,
+        prompt: str,
+        token: str,
+        *,
+        user_id: int,
+        session_name: str = "bale",
+        on_stage: Callable[[str], Awaitable[None]] | None = None,
+    ) -> AgentResult:
         s = self._s
+        user_token = (
+            tokens.issue_user_token(s.proxy_secret, user_id)
+            if len(s.proxy_secret) >= 16
+            else token
+        )
+
         # the prompt travels as a file, never on a command line
         await self._incus.run(*self._as_agent(name, "rm", "-rf", OUTBOX, f"{HOME}/in"))
         await self._incus.run(
-            *self._as_agent(name, "mkdir", "-p", OUTBOX, f"{HOME}/in", f"{HOME}/workspace")
+            *self._as_agent(
+                name,
+                "mkdir",
+                "-p",
+                OUTBOX,
+                f"{HOME}/in",
+                f"{HOME}/workspace",
+                f"{HOME}/.local/bin",
+            )
         )
+
+        if on_stage:
+            await on_stage("🧠 مرحله ۲ از ۳: بارگذاری حافظهٔ گفتگو و ارسال به هستهٔ هرمس...")
+
         pushed = await self._incus.run(
             "file", "push", "-", f"{name}{QUERY_PATH}",
             "--mode", "0600", "--uid", AGENT_UID, "--gid", AGENT_UID,
@@ -176,17 +232,107 @@ class SandboxManager:
         )  # fmt: skip
         if not pushed.ok:
             raise SandboxError("could not hand the task to the sandbox")
+
+        # Push AGENTS.md to home and workspace
+        agents_bytes = texts.HERMES_AGENTS_MD.encode()
+        await self._incus.run(
+            "file", "push", "-", f"{name}{HOME}/AGENTS.md",
+            "--mode", "0644", "--uid", AGENT_UID, "--gid", AGENT_UID,
+            stdin=agents_bytes,
+        )  # fmt: skip
+        await self._incus.run(
+            "file", "push", "-", f"{name}{HOME}/workspace/AGENTS.md",
+            "--mode", "0644", "--uid", AGENT_UID, "--gid", AGENT_UID,
+            stdin=agents_bytes,
+        )  # fmt: skip
+
+        # Push helper scripts
+        notify_url = f"{s.proxy_url.rstrip('/')}/bale/notify"
+        bale_send_script = (
+            "#!/usr/bin/env python3\n"
+            "import json, sys, urllib.request\n\n"
+            f"URL = {notify_url!r}\n"
+            f"TOKEN = {user_token!r}\n\n"
+            "text = ' '.join(sys.argv[1:]) if len(sys.argv) > 1 else sys.stdin.read()\n"
+            "text = text.strip()\n"
+            "if not text:\n"
+            "    sys.exit(0)\n"
+            "req = urllib.request.Request(\n"
+            "    URL,\n"
+            "    data=json.dumps({'text': text}).encode(),\n"
+            "    headers={\n"
+            "        'Content-Type': 'application/json',\n"
+            "        'Authorization': f'Bearer {TOKEN}',\n"
+            "    },\n"
+            "    method='POST',\n"
+            ")\n"
+            "try:\n"
+            "    with urllib.request.urlopen(req, timeout=30) as r:\n"
+            "        print(r.read().decode())\n"
+            "except Exception as e:\n"
+            "    print(f'Error: {e}', file=sys.stderr)\n"
+            "    sys.exit(1)\n"
+        )
+        await self._incus.run(
+            "file", "push", "-", f"{name}{HOME}/.local/bin/bale-send",
+            "--mode", "0755", "--uid", AGENT_UID, "--gid", AGENT_UID,
+            stdin=bale_send_script.encode(),
+        )  # fmt: skip
+
+        search_url = f"{s.proxy_url.rstrip('/')}/web/search"
+        web_search_script = (
+            "#!/usr/bin/env python3\n"
+            "import json, sys, urllib.request\n\n"
+            f"URL = {search_url!r}\n"
+            f"TOKEN = {user_token!r}\n\n"
+            "query = ' '.join(sys.argv[1:]) if len(sys.argv) > 1 else sys.stdin.read()\n"
+            "query = query.strip()\n"
+            "if not query:\n"
+            "    print('Usage: web-search <query>')\n"
+            "    sys.exit(1)\n"
+            "req = urllib.request.Request(\n"
+            "    URL,\n"
+            "    data=json.dumps({'query': query}).encode(),\n"
+            "    headers={\n"
+            "        'Content-Type': 'application/json',\n"
+            "        'Authorization': f'Bearer {TOKEN}',\n"
+            "    },\n"
+            "    method='POST',\n"
+            ")\n"
+            "try:\n"
+            "    with urllib.request.urlopen(req, timeout=30) as r:\n"
+            "        data = json.loads(r.read().decode())\n"
+            "        print(data.get('formatted') or json.dumps(data, ensure_ascii=False))\n"
+            "except Exception as e:\n"
+            "    print(f'Search error: {e}', file=sys.stderr)\n"
+            "    sys.exit(1)\n"
+        )
+        await self._incus.run(
+            "file", "push", "-", f"{name}{HOME}/.local/bin/web-search",
+            "--mode", "0755", "--uid", AGENT_UID, "--gid", AGENT_UID,
+            stdin=web_search_script.encode(),
+        )  # fmt: skip
+
+        if on_stage:
+            await on_stage("🛠 مرحله ۳ از ۳: در حال تفکر و اجرای ابزارها در محیط ایزوله...")
+
         cmd = [
             "timeout", "-k", "5", str(s.agent_timeout),
             "hermes", "chat", "--yolo", "-Q", "--oneshot", "--query-file", QUERY_PATH,
             "--provider", "custom", "--base-url", s.proxy_url, "--api-key", token,
-            "--model", "agent", "--max-turns", str(s.agent_max_turns),
+            "--model", "balebot", "--max-turns", str(s.agent_max_turns),
             "--ignore-user-config",
+            "--continue", session_name, "--create-if-missing",
         ]  # fmt: skip
         if s.agent_toolsets.strip():
             cmd += ["-t", s.agent_toolsets.strip()]
         res = await self._incus.run(*self._as_agent(name, *cmd), timeout=s.agent_timeout + 30)
-        text = res.out.decode("utf-8", "replace").replace(token, "[redacted]").strip()
+        text = (
+            res.out.decode("utf-8", "replace")
+            .replace(token, "[redacted]")
+            .replace(user_token, "[redacted]")
+            .strip()
+        )
         timed_out = res.rc in (124, 137)
         if timed_out:
             await self._incus.run(*self._as_agent(name, "pkill", "-f", "hermes_cli"), timeout=5)

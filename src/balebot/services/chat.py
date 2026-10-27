@@ -109,6 +109,7 @@ class ChatService:
         text: str,
         delete_incoming: Deleter | None = None,
         progress: Callable[[str], Awaitable[None]] | None = None,
+        on_stage: Callable[[str], Awaitable[None]] | None = None,
     ) -> Reply:
         text = text.strip()
         day = self._today()
@@ -133,7 +134,9 @@ class ChatService:
             return Reply(texts.TOO_LONG.format(max=self._settings.max_input_chars))
 
         if cmd == "/agent":
-            return await self._agent(user_id, selected, text, limit, day, progress)
+            return await self._agent(
+                user_id, selected, text, limit, day, progress, on_stage=on_stage
+            )
         if cmd in ("/help", "/guide"):
             return Reply(texts.HELP, texts.MAIN_MENU_KEYBOARD)
         if cmd == "/menu":
@@ -145,7 +148,20 @@ class ChatService:
             return Reply(texts.UNSUPPORTED)
 
         if self.keys is not None and await self.keys.pop_agent_pending(user_id):
-            return await self._agent(user_id, selected, f"/agent {text}", limit, day, progress)
+            return await self._agent(
+                user_id, selected, f"/agent {text}", limit, day, progress, on_stage=on_stage
+            )
+
+        if (
+            not cmd.startswith("/")
+            and self.sandbox is not None
+            and self._settings.sandbox_enabled
+            and self._settings.unified_hermes
+            and len(self._settings.proxy_secret) >= 16
+        ):
+            return await self._agent(
+                user_id, selected, f"/agent {text}", limit, day, progress, on_stage=on_stage
+            )
 
         route = await self.keys.resolve(user_id, selected) if self.keys else None
         if route is None:  # free base model: counts against the daily quota
@@ -194,6 +210,7 @@ class ChatService:
         limit: int,
         day: date,
         progress: Callable[[str], Awaitable[None]] | None,
+        on_stage: Callable[[str], Awaitable[None]] | None = None,
     ) -> Reply:
         """Run a task with Hermes tools inside the user's sandbox."""
         s = self._settings
@@ -216,13 +233,28 @@ class ChatService:
                 await db.commit()
             if not ok:
                 return Reply(texts.AGENT_NO_QUOTA.format(cost=cost))
+
+        async with self._sm() as db:
+            user = await db.get(User, user_id)
+            session_name = (
+                f"bale-{int(user.context_reset_at.timestamp())}"
+                if user and user.context_reset_at
+                else "bale"
+            )
+
         if progress:
             await progress(texts.AGENT_RUNNING)
         token = tokens.issue(
             s.proxy_secret, user_id, ttl=s.agent_timeout + 120, max_calls=s.agent_max_llm_calls
         )
         try:
-            result = await self.sandbox.run_agent(user_id, task, token=token)
+            result = await self.sandbox.run_agent(
+                user_id,
+                task,
+                token=token,
+                session_name=session_name,
+                on_stage=on_stage,
+            )
         except (SandboxError, OSError):
             result = None
         if result is None or (not result.ok and not result.text and not result.timed_out):
@@ -234,6 +266,13 @@ class ChatService:
         text_out = result.text or texts.AGENT_EMPTY
         if result.timed_out:
             text_out = f"{text_out}\n\n{texts.AGENT_TIMEOUT}"
+
+        if result.ok:
+            async with self._sm() as db:
+                db.add(Message(user_id=user_id, role="user", content=task))
+                db.add(Message(user_id=user_id, role="assistant", content=text_out))
+                await db.commit()
+
         return Reply(text_out, files=result.files)
 
     async def _simple_command(self, user_id: int, cmd: str, limit: int, day: date) -> str:

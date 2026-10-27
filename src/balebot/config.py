@@ -39,8 +39,10 @@ class Settings(BaseSettings):
     # needs a pool with quotas (btrfs/zfs), not `dir`; must equal the template's root size
     sandbox_disk: str = "3GiB"
     sandbox_processes: int = 256
-    sandbox_idle_minutes: int = 30
-    sandbox_destroy_days: int = 14
+    sandbox_idle_minutes: int = 15
+    sandbox_destroy_days: int = 365
+    unified_hermes: bool = True
+    max_context_messages: int = 20
     agent_cost: int = 5  # free-quota units one /agent run costs (own-key runs are free)
     agent_timeout: int = 600
     agent_max_turns: int = 20

@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import select
 
 from balebot import texts
-from balebot.models import Sandbox, User, utcnow
+from balebot.models import Message, Sandbox, User, utcnow
 from balebot.sandbox import tokens
 from balebot.sandbox.manager import sandbox_name
 from balebot.sandbox.proxy import create_proxy_app
@@ -327,3 +327,91 @@ async def test_proxy_retries_on_upstream_timeout_and_429(
         r = await c.post("/v1/chat/completions", json=BODY, headers=bearer(uid))
         assert r.status_code == 200
         assert calls == 3
+
+
+async def test_unified_hermes_and_multiturn_history_reset(agent_state, incus) -> None:
+    reply = await agent_state.chat.handle_message(1, None, "سلام هرمس")
+    assert reply.text == "agent says hi"
+    assert incus.pushed["u1/home/agent/in/query.txt"] == "سلام هرمس".encode()
+
+    async with agent_state.sessionmaker() as s:
+        user = await s.scalar(select(User).where(User.bale_id == 1))
+        assert user is not None
+        rows = list(
+            (
+                await s.scalars(
+                    select(Message).where(Message.user_id == user.id).order_by(Message.id.asc())
+                )
+            ).all()
+        )
+        assert len(rows) == 2
+        assert rows[0].role == "user" and rows[0].content == "سلام هرمس"
+        assert rows[1].role == "assistant" and rows[1].content == "agent says hi"
+
+    await agent_state.chat.handle_message(1, None, "/new")
+    async with agent_state.sessionmaker() as s:
+        user_after = await s.get(User, user.id)
+        assert user_after is not None and user_after.context_reset_at is not None
+        reset_ts = int(user_after.context_reset_at.timestamp())
+
+    incus.calls.clear()
+    await agent_state.chat.handle_message(1, None, "پیام دوم")
+    call = incus.hermes_call()
+    assert "--continue" in call
+    assert call[call.index("--continue") + 1] == f"bale-{reset_ts}"
+
+
+async def test_ensure_skips_start_when_already_running(agent_state, incus) -> None:
+    assert agent_state.sandbox is not None
+    await say(agent_state, 1, "/agent hi")
+    assert "u1" in incus.instances
+    incus.calls.clear()
+
+    incus.running_status = True
+    name = await agent_state.sandbox.ensure(1)
+    assert name == "u1"
+    assert not any(c[0] == "start" for c in incus.calls)
+
+
+async def test_live_progress_edits_message_in_place(agent_state, incus) -> None:
+    from balebot.gateway.updates import process_update
+
+    update_payload = {
+        "update_id": 77,
+        "message": {
+            "message_id": 10,
+            "chat": {"id": 1},
+            "from": {"id": 1},
+            "text": "/agent run task",
+        },
+    }
+    await process_update(agent_state, update_payload)
+    assert len(agent_state.bale.edited) >= 2
+    assert agent_state.bale.sent[-1][1] == "agent says hi"
+
+
+async def test_proxy_bale_notify_sends_message(proxy, agent_state) -> None:
+    uid = await make_user(agent_state, bale_id=1)
+    token = tokens.issue_user_token(SECRET, uid)
+    r = await proxy.post(
+        "/v1/bale/notify",
+        json={"text": "پیام زمانبندیشده تست"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 200 and r.json() == {"ok": True}
+    assert (1, "پیام زمانبندیشده تست", None) in agent_state.bale.sent
+
+
+async def test_proxy_web_search_returns_results(proxy, agent_state, provider) -> None:
+    uid = await make_user(agent_state)
+    token = tokens.issue_user_token(SECRET, uid)
+    r = await proxy.post(
+        "/v1/web/search",
+        json={"query": "اخبار ایران"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    assert data["query"] == "اخبار ایران"
+

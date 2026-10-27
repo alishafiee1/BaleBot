@@ -8,7 +8,14 @@ MAX_MESSAGE = 3500
 class BaleApi(Protocol):
     async def send_message(
         self, chat_id: int, text: str, keyboard: list[list[dict[str, str]]] | None = None
-    ) -> None: ...
+    ) -> int | None: ...
+    async def edit_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        keyboard: list[list[dict[str, str]]] | None = None,
+    ) -> bool: ...
     async def delete_message(self, chat_id: int, message_id: int) -> None: ...
     async def send_document(self, chat_id: int, name: str, data: bytes) -> None: ...
     async def answer_callback(self, callback_id: str) -> None: ...
@@ -31,13 +38,42 @@ class BaleClient:
 
     async def send_message(
         self, chat_id: int, text: str, keyboard: list[list[dict[str, str]]] | None = None
-    ) -> None:
+    ) -> int | None:
         chunks = [text[i : i + MAX_MESSAGE] for i in range(0, max(len(text), 1), MAX_MESSAGE)]
+        first_mid: int | None = None
         for n, chunk in enumerate(chunks):
             payload: dict[str, Any] = {"chat_id": chat_id, "text": chunk}
             if keyboard and n == len(chunks) - 1:
                 payload["reply_markup"] = {"inline_keyboard": keyboard}
-            await self._call("sendMessage", payload)
+            resp = await self._call("sendMessage", payload)
+            if first_mid is None and isinstance(resp, dict):
+                mid = resp.get("result", {}).get("message_id")
+                if mid is not None:
+                    try:
+                        first_mid = int(mid)
+                    except (ValueError, TypeError):
+                        pass
+        return first_mid
+
+    async def edit_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        keyboard: list[list[dict[str, str]]] | None = None,
+    ) -> bool:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text[:MAX_MESSAGE],
+        }
+        if keyboard is not None:
+            payload["reply_markup"] = {"inline_keyboard": keyboard}
+        try:
+            resp = await self._call("editMessageText", payload, timeout=20.0)
+            return bool(isinstance(resp, dict) and resp.get("ok"))
+        except Exception:  # noqa: BLE001
+            return False
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         await self._call(

@@ -49,3 +49,32 @@ def verify(secret: str, token: str, *, now: float | None = None) -> AgentToken:
     if int(exp) < (now if now is not None else time.time()):
         raise BadToken("expired")
     return AgentToken(int(user), run, int(exp), int(calls))
+
+
+def issue_user_token(secret: str, user_id: int, scope: str = "sandbox") -> str:
+    if len(secret) < 16:
+        raise ValueError("proxy secret too short")
+    payload = f"{user_id}.{scope}"
+    return f"bbu.{payload}.{_sign(secret, payload)}"
+
+
+def verify_user_token(secret: str, raw: str, scope: str = "sandbox") -> int:
+    parts = raw.split(".")
+    if len(parts) != 4 or parts[0] != "bbu" or len(secret) < 16:
+        raise BadToken("malformed")
+    user, tok_scope, sig = parts[1:]
+    payload = f"{user}.{tok_scope}"
+    if not hmac.compare_digest(sig, _sign(secret, payload)):
+        raise BadToken("signature")
+    if tok_scope != scope or not user.isdigit():
+        raise BadToken("malformed")
+    return int(user)
+
+
+def verify_any_token(secret: str, raw: str) -> int:
+    if raw.startswith("bbt."):
+        tok = verify(secret, raw)
+        return tok.user_id
+    if raw.startswith("bbu."):
+        return verify_user_token(secret, raw)
+    raise BadToken("unknown token prefix")

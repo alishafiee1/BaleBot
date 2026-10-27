@@ -32,17 +32,46 @@ class FakeModel:
         return self.reply or f"echo:{messages[-1]['content']}"
 
 
+class SentTuple(tuple):
+    def __new__(cls, chat_id: int, text: str, keyboard: Any = None):
+        return super().__new__(cls, (chat_id, text, keyboard))
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, tuple):
+            if len(other) == 2:
+                return (self[0], self[1]) == other
+            if len(other) == 3:
+                return (self[0], self[1], self[2]) == other
+        return False
+
+
 class FakeBale:
     def __init__(self) -> None:
-        self.sent: list[tuple[int, str]] = []
+        self.sent: list[Any] = []
         self.keyboards: list = []
+        self.edited: list[tuple[int, int, str, Any]] = []
         self.deleted: list[tuple[int, int]] = []
         self.documents: list[tuple[int, str, bytes]] = []
         self.actions: list[tuple[int, str]] = []
 
-    async def send_message(self, chat_id: int, text: str, keyboard=None) -> None:
-        self.sent.append((chat_id, text))
+    async def send_message(self, chat_id: int, text: str, keyboard=None) -> int:
+        msg = SentTuple(chat_id, text, keyboard)
+        self.sent.append(msg)
         self.keyboards.append(keyboard)
+        return len(self.sent)
+
+    async def edit_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        keyboard: list[list[dict[str, str]]] | None = None,
+    ) -> bool:
+        self.edited.append((chat_id, message_id, text, keyboard))
+        if 1 <= message_id <= len(self.sent):
+            self.sent[message_id - 1] = SentTuple(chat_id, text, keyboard)
+            return True
+        return False
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         self.deleted.append((chat_id, message_id))
@@ -177,6 +206,7 @@ class FakeIncus:
         self.agent_rc = 0
         self.fail: set[str] = set()  # subcommand keys that should fail: "copy", "disk", "start"
         self.gate: asyncio.Event | None = None  # hold the agent run until set
+        self.running_status: bool = False
 
     def _res(self, ok: bool = True, out: bytes = b"") -> IncusResult:
         return IncusResult(0 if ok else 1, out, "" if ok else "failed")
@@ -187,7 +217,8 @@ class FakeIncus:
         self.calls.append(args)
         cmd = args[0]
         if cmd == "info":
-            return self._res(args[1] in self.instances)
+            out = b"Status: RUNNING\n" if self.running_status else b""
+            return self._res(args[1] in self.instances, out=out)
         if cmd == "copy":
             if "copy" in self.fail:
                 return self._res(False)

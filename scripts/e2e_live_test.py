@@ -53,7 +53,9 @@ from balebot.models import (  # noqa: E402
     User,
 )
 from balebot.net.safe_http import SafeHttp  # noqa: E402
+from balebot.sandbox import tokens  # noqa: E402
 from balebot.sandbox.incus import IncusResult  # noqa: E402
+from balebot.sandbox.proxy import create_proxy_app  # noqa: E402
 from balebot.security import hash_password  # noqa: E402
 from balebot.vault import Vault  # noqa: E402
 
@@ -142,6 +144,7 @@ class SuiteReport:
 class SpyBale:
     def __init__(self) -> None:
         self.sent: list[tuple[int, str, Any]] = []
+        self.edited: list[tuple[int, int, str, Any]] = []
         self.deleted: list[tuple[int, int]] = []
         self.documents: list[tuple[int, str, bytes]] = []
         self.callbacks_answered: list[str] = []
@@ -152,8 +155,22 @@ class SpyBale:
         chat_id: int,
         text: str,
         keyboard: list[list[dict[str, str]]] | None = None,
-    ) -> None:
+    ) -> int:
         self.sent.append((chat_id, text, keyboard))
+        return len(self.sent)
+
+    async def edit_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        keyboard: list[list[dict[str, str]]] | None = None,
+    ) -> bool:
+        self.edited.append((chat_id, message_id, text, keyboard))
+        if 1 <= message_id <= len(self.sent):
+            self.sent[message_id - 1] = (chat_id, text, keyboard)
+            return True
+        return False
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         self.deleted.append((chat_id, message_id))
@@ -216,13 +233,17 @@ class SmartTestModel:
 
 
 class SpyIncus:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        model: SmartTestModel | None = None,
+        state: Any = None,
+    ) -> None:
         self.calls: list[tuple[str, ...]] = []
         self.instances: set[str] = set()
         self.pushed: dict[str, bytes] = {}
-        self.outbox: dict[str, bytes] = {
-            "test_status.txt": b"2026-10-27\nPython 3.12.3\n",
-        }
+        self.outbox: dict[str, bytes] = {}
+        self.model = model
+        self.state = state
 
     async def run(
         self,
@@ -244,14 +265,42 @@ class SpyIncus:
             fname = args[2].rsplit("/", 1)[-1]
             return IncusResult(0, self.outbox.get(fname, b""), "")
         if cmd == "exec" and "hermes" in args:
-            out = (
-                "فایل `/home/agent/workspace/test_status.txt` با موفقیت ساخته شد.\n"
-                "تاریخ امروز: 2026-10-27\n"
-                "نسخه پایتون داخل سندباکس: Python 3.12.3"
-            )
-            return IncusResult(0, out.encode("utf-8"), "")
+            name = args[1]
+            qpath = f"{name}/home/agent/in/query.txt"
+            prompt = self.pushed.get(qpath, b"").decode("utf-8", "replace")
+            if "test_status.txt" in prompt:
+                self.outbox["test_status.txt"] = b"2026-10-27\nPython 3.12.3\n"
+                out = (
+                    "فایل `/home/agent/workspace/test_status.txt` با موفقیت ساخته شد.\n"
+                    "تاریخ امروز: 2026-10-27\n"
+                    "نسخه پایتون داخل سندباکس: Python 3.12.3"
+                )
+                return IncusResult(0, out.encode("utf-8"), "")
+            if self.model is not None and self.state is not None:
+                user_id = int(name.removeprefix("u"))
+                async with self.state.sessionmaker() as s:
+                    user = await s.get(User, user_id)
+                    q = select(Message).where(Message.user_id == user_id)
+                    if user and user.context_reset_at:
+                        q = q.where(Message.created_at > user.context_reset_at)
+                    rows = list((await s.scalars(q.order_by(Message.id.asc()))).all())
+                history = [{"role": m.role, "content": m.content} for m in rows]
+                messages = [
+                    {"role": "system", "content": texts.HERMES_BALE_SYSTEM_PROMPT},
+                    *history,
+                    {"role": "user", "content": prompt},
+                ]
+                reply = await self.model.chat(
+                    base_url="http://fake",
+                    api_key="fake",
+                    model="balebot",
+                    messages=messages,
+                )
+                return IncusResult(0, reply.encode("utf-8"), "")
+            return IncusResult(0, f"پاسخ تست در پیام‌رسان بله: {prompt}".encode(), "")
         if cmd == "exec" and "find" in args:
-            return IncusResult(0, b"test_status.txt\n", "")
+            out_files = "\n".join(self.outbox)
+            return IncusResult(0, f"{out_files}\n".encode() if out_files else b"", "")
         return IncusResult(0, b"", "")
 
 
@@ -326,7 +375,7 @@ async def run_full_suite(
     print("\n=== Running Full E2E Suite (Scenarios 1-7) ===", flush=True)
     bale = SpyBale()
     model = SmartTestModel()
-    incus = SpyIncus()
+    incus = SpyIncus(model=model)
     suite_hook = secrets.token_urlsafe(18)
     admin_pw = secrets.token_urlsafe(16)
 
@@ -341,7 +390,7 @@ async def run_full_suite(
         database_url="sqlite+aiosqlite://",
         webhook_secret=suite_hook,
         base_model_api_key=secrets.token_urlsafe(16),
-        default_daily_quota=15,
+        default_daily_quota=30,
         session_secret=secrets.token_urlsafe(32),
         vault_key=Vault.generate_key(),
         cookie_secure=False,
@@ -353,6 +402,7 @@ async def run_full_suite(
     state = build_state(
         settings, model_client=model, bale=bale, http=http, incus=incus
     )
+    incus.state = state
     app = create_app(state)
     hook_path = f"/bale/webhook/{suite_hook}"
 
@@ -602,6 +652,47 @@ async def run_full_suite(
                 f"sandbox=u{user_row.id}, files={len(bale.documents)}",
             )
 
+            # Live Progress Editing & Sandbox Utility Endpoints (/notify, /search)
+            t0 = time.perf_counter()
+            proxy_app = create_proxy_app(state)
+            proxy_transport = httpx.ASGITransport(app=proxy_app)
+            user_tok = tokens.issue_user_token(settings.proxy_secret, user_row.id)
+            proxy_headers = {"Authorization": f"Bearer {user_tok}"}
+
+            async with httpx.AsyncClient(
+                transport=proxy_transport, base_url="http://proxy"
+            ) as pclient:
+                r_notify = await pclient.post(
+                    "/v1/bale/notify",
+                    json={"text": "اعلان تست پروکسی به بله"},
+                    headers=proxy_headers,
+                )
+                r_search = await pclient.post(
+                    "/v1/web/search",
+                    json={"query": "اخبار تست"},
+                    headers=proxy_headers,
+                )
+            dt_upgrades = (time.perf_counter() - t0) * 1000
+            ok_upgrades = (
+                len(bale.edited) >= 2
+                and r_notify.status_code == 200
+                and r_notify.json() == {"ok": True}
+                and r_search.status_code == 200
+                and r_search.json().get("ok") is True
+            )
+            summary_upgrades = (
+                f"edits={len(bale.edited)}, "
+                f"notify={r_notify.status_code}, "
+                f"search={r_search.status_code}"
+            )
+            report.record(
+                "Scenario 5 (/agent Sandbox)",
+                "Live progress editing + Proxy endpoints (/v1/bale/notify & /v1/web/search)",
+                ok_upgrades,
+                dt_upgrades,
+                summary_upgrades,
+            )
+
             # --- Scenario 6: Web Admin Panel Health, CSRF & Auth ---
             t0 = time.perf_counter()
             r_hz = await client.get("/healthz")
@@ -679,11 +770,15 @@ async def run_full_suite(
                     select(UsageDaily).where(UsageDaily.user_id == user_row.id)
                 )
                 assert usage_row is not None
-                usage_row.count = 15
+                usage_row.count = 30
                 await s.commit()
             await client.post(hook_path, json=make_msg("پیام خارج از سهمیه"))
             dt_quota = (time.perf_counter() - t0) * 1000
-            ok_quota = bale.sent[-1][1] == texts.QUOTA_EXHAUSTED
+            last_reply = bale.sent[-1][1]
+            ok_quota = (
+                last_reply == texts.QUOTA_EXHAUSTED
+                or texts.AGENT_NO_QUOTA.format(cost=state.settings.agent_cost) in last_reply
+            )
             report.record(
                 "Scenario 7 (Security & Resilience)",
                 "Daily quota enforcement blocks excess requests without upstream call",
