@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -37,6 +38,7 @@ class FakeBale:
         self.keyboards: list = []
         self.deleted: list[tuple[int, int]] = []
         self.documents: list[tuple[int, str, bytes]] = []
+        self.actions: list[tuple[int, str]] = []
 
     async def send_message(self, chat_id: int, text: str, keyboard=None) -> None:
         self.sent.append((chat_id, text))
@@ -50,6 +52,9 @@ class FakeBale:
 
     async def answer_callback(self, callback_id: str) -> None:
         pass
+
+    async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
+        self.actions.append((chat_id, action))
 
     async def get_updates(self, offset: int, timeout: int = 30) -> list:
         return []
@@ -129,7 +134,7 @@ def incus() -> FakeIncus:
 @pytest.fixture
 async def agent_state(
     settings: Settings, model: FakeModel, bale: FakeBale, provider: FakeProvider, incus: FakeIncus
-) -> AppState:
+) -> AsyncIterator[AppState]:
     agent_settings = settings.model_copy(
         update={
             "sandbox_enabled": True,
@@ -141,17 +146,23 @@ async def agent_state(
     http = SafeHttp(transport=httpx.MockTransport(provider.handler))
     st = build_state(agent_settings, model_client=model, bale=bale, http=http, incus=incus)
     await create_all(st.engine)
-    return st
+    try:
+        yield st
+    finally:
+        await st.engine.dispose()
 
 
 @pytest.fixture
 async def state(
     settings: Settings, model: FakeModel, bale: FakeBale, provider: FakeProvider
-) -> AppState:
+) -> AsyncIterator[AppState]:
     http = SafeHttp(transport=httpx.MockTransport(provider.handler))
     st = build_state(settings, model_client=model, bale=bale, http=http)
     await create_all(st.engine)
-    return st
+    try:
+        yield st
+    finally:
+        await st.engine.dispose()
 
 
 class FakeIncus:

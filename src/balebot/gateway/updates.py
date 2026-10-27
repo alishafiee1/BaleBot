@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Any
 
 from balebot import texts
@@ -28,13 +29,18 @@ async def _send_files(state: AppState, chat_id: int, reply: Reply) -> None:
 
 async def process_update(state: AppState, update: dict[str, Any]) -> None:
     """Turn one Bale update into at most one reply. Never raises, so polling keeps going."""
+    t0 = time.perf_counter()
+    uid = update.get("update_id", "-")
+    kind = "callback" if "callback_query" in update else "message"
     try:
         if cq := update.get("callback_query"):
             await _callback(state, cq)
         elif message := update.get("message"):
             await _message(state, message)
+        dt_ms = (time.perf_counter() - t0) * 1000
+        log.info("processed update_id=%s kind=%s elapsed_ms=%.1f", uid, kind, dt_ms)
     except Exception as exc:  # noqa: BLE001
-        log.warning("update failed: %s", type(exc).__name__)
+        log.warning("update failed update_id=%s: %s", uid, type(exc).__name__)
 
 
 async def _message(state: AppState, message: dict[str, Any]) -> None:
@@ -58,6 +64,13 @@ async def _message(state: AppState, message: dict[str, Any]) -> None:
 
     async def progress(note: str) -> None:
         await state.bale.send_message(chat_id, note)
+
+    stripped = text.strip()
+    if not stripped.startswith("/") or stripped == "/agent" or stripped.startswith("/agent "):
+        try:
+            await state.bale.send_chat_action(chat_id, "typing")
+        except Exception as exc:  # noqa: BLE001
+            log.debug("sendChatAction failed: %s", type(exc).__name__)
 
     reply = await state.chat.handle_message(
         bale_id, sender.get("username"), text, delete_incoming, progress

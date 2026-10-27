@@ -166,7 +166,9 @@ class SandboxManager:
         s = self._s
         # the prompt travels as a file, never on a command line
         await self._incus.run(*self._as_agent(name, "rm", "-rf", OUTBOX, f"{HOME}/in"))
-        await self._incus.run(*self._as_agent(name, "mkdir", "-p", OUTBOX, f"{HOME}/in"))
+        await self._incus.run(
+            *self._as_agent(name, "mkdir", "-p", OUTBOX, f"{HOME}/in", f"{HOME}/workspace")
+        )
         pushed = await self._incus.run(
             "file", "push", "-", f"{name}{QUERY_PATH}",
             "--mode", "0600", "--uid", AGENT_UID, "--gid", AGENT_UID,

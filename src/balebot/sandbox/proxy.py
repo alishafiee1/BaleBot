@@ -99,9 +99,24 @@ def create_proxy_app(state: AppState) -> FastAPI:
         used[tok.run_id] = (count + 1, tok.expires)
         return count + 1
 
+    @app.get("/v1/props")
+    async def props() -> dict[str, Any]:
+        return {"default_generation_settings": {"n_ctx": 128000}}
+
     @app.get("/v1/models")
+    @app.get("/api/v1/models")
     async def models() -> dict[str, Any]:
-        return {"object": "list", "data": [{"id": "agent", "object": "model"}]}
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": "agent",
+                    "object": "model",
+                    "owned_by": "balebot",
+                    "context_length": 128000,
+                }
+            ],
+        }
 
     @app.post("/v1/chat/completions", response_model=None)
     async def completions(request: Request) -> Any:

@@ -65,3 +65,14 @@ async def test_admin_rejects_http_base_url(client) -> None:
         "/admin/api/settings", auth=("admin", "pw-for-tests"), json={"base_url": "http://x.example"}
     )
     assert r.status_code == 422
+
+
+async def test_webhook_ignores_duplicate_update(client, bale, model) -> None:
+    payload = update("hello-once")
+    r1 = await client.post("/bale/webhook/s3cret", json=payload)
+    r2 = await client.post("/bale/webhook/s3cret", json=payload)
+    assert r1.status_code == 200 and r1.json() == {"ok": True}
+    assert r2.status_code == 200 and r2.json() == {"ok": True, "duplicate_ignored": True}
+    assert bale.sent == [(7, "echo:hello-once")]
+    assert len(model.calls) == 1
+    assert (7, "typing") in bale.actions
