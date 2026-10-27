@@ -131,12 +131,28 @@ def create_proxy_app(state: AppState) -> FastAPI:
             "object": "list",
             "data": [
                 {
+                    "id": "balebot",
+                    "object": "model",
+                    "owned_by": "balebot",
+                    "context_length": 128000,
+                },
+                {
                     "id": "agent",
                     "object": "model",
                     "owned_by": "balebot",
                     "context_length": 128000,
-                }
+                },
             ],
+        }
+
+    @app.get("/v1/models/{model_id}")
+    @app.get("/api/v1/models/{model_id}")
+    async def get_model(model_id: str) -> dict[str, Any]:
+        return {
+            "id": model_id,
+            "object": "model",
+            "owned_by": "balebot",
+            "context_length": 128000,
         }
 
     @app.post("/v1/chat/completions", response_model=None)

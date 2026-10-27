@@ -145,6 +145,8 @@ class SpyBale:
     def __init__(self) -> None:
         self.sent: list[tuple[int, str, Any]] = []
         self.edited: list[tuple[int, int, str, Any]] = []
+        self.reply_keyboards: list[tuple[int, str, Any]] = []
+        self.commands: list[dict[str, str]] = []
         self.deleted: list[tuple[int, int]] = []
         self.documents: list[tuple[int, str, bytes]] = []
         self.callbacks_answered: list[str] = []
@@ -171,6 +173,16 @@ class SpyBale:
             self.sent[message_id - 1] = (chat_id, text, keyboard)
             return True
         return False
+
+    async def send_reply_keyboard(
+        self, chat_id: int, text: str, reply_keyboard: list[list[dict[str, str]]]
+    ) -> int | None:
+        self.reply_keyboards.append((chat_id, text, reply_keyboard))
+        return 1
+
+    async def set_my_commands(self, commands: list[dict[str, str]] | None = None) -> bool:
+        self.commands = commands or texts.BOT_COMMANDS
+        return True
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         self.deleted.append((chat_id, message_id))
@@ -785,6 +797,46 @@ async def run_full_suite(
                 ok_quota,
                 dt_quota,
                 "QUOTA_EXHAUSTED verified",
+            )
+
+            # Scenario 8: Command Menu, Bottom Reply Keyboard & Legacy Commands
+            t0 = time.perf_counter()
+            await client.post(hook_path, json=make_msg("شروع مجدد"))
+            r_restart = bale.sent[-1]
+            await client.post(hook_path, json=make_msg("/settings"))
+            r_settings = bale.sent[-1]
+            await client.post(hook_path, json=make_msg("/status"))
+            r_status = bale.sent[-1]
+            await client.post(hook_path, json=make_msg("🔄 گفتگوی تازه"))
+            r_btn_new = bale.sent[-1]
+            await client.post(hook_path, json=make_msg("🤖 انتخاب مدل"))
+            r_btn_models = bale.sent[-1]
+            await client.post(hook_path, json=make_msg("/think"))
+            r_think_bare = bale.sent[-1]
+            await client.post(hook_path, json=make_msg("/daily"))
+            r_daily_bare = bale.sent[-1]
+            dt = (time.perf_counter() - t0) * 1000
+            sc8_ok = (
+                "سلام" in r_restart[1]
+                and r_settings[1] == texts.MENU_TEXT
+                and "وضعیت سرور" in r_status[1]
+                and r_btn_new[1] == texts.NEW_CHAT
+                and texts.MODELS_HEADER in r_btn_models[1]
+                and "حالت تفکر" in r_think_bare[1]
+                and "گزارش روزانه" in r_daily_bare[1]
+                and len(bale.reply_keyboards) >= 3
+                and len(texts.BOT_COMMANDS) == 6
+            )
+            sc8_detail = (
+                f"reply_keyboards_sent={len(bale.reply_keyboards)}, "
+                f"commands={len(texts.BOT_COMMANDS)}"
+            )
+            report.record(
+                "Scenario 8 (UI Menu, Bottom Keyboard & Legacy Commands)",
+                "Test شروع مجدد, 2x3 ReplyKeyboardMarkup, /settings, /status, /think, /daily",
+                sc8_ok,
+                dt,
+                sc8_detail,
             )
 
             # Verify DB table counts at end of in-process suite

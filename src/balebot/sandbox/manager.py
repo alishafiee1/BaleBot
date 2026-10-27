@@ -5,6 +5,7 @@ pre-built `agent-base` image. Idle containers are stopped; old ones are destroye
 """
 
 import asyncio
+import contextlib
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -326,7 +327,28 @@ class SandboxManager:
         ]  # fmt: skip
         if s.agent_toolsets.strip():
             cmd += ["-t", s.agent_toolsets.strip()]
-        res = await self._incus.run(*self._as_agent(name, *cmd), timeout=s.agent_timeout + 30)
+
+        ticker: asyncio.Task[None] | None = None
+        if on_stage is not None:
+
+            async def _tick() -> None:
+                elapsed = 0
+                while True:
+                    await asyncio.sleep(5.0)
+                    elapsed += 5
+                    stage_msg = (
+                        "🛠 مرحله ۳ از ۳: در حال تفکر و اجرای ابزارها در محیط ایزوله... "
+                        f"(⏱ {elapsed} ثانیه)"
+                    )
+                    with contextlib.suppress(Exception):
+                        await on_stage(stage_msg)
+
+            ticker = asyncio.create_task(_tick())
+        try:
+            res = await self._incus.run(*self._as_agent(name, *cmd), timeout=s.agent_timeout + 30)
+        finally:
+            if ticker is not None:
+                ticker.cancel()
         text = (
             res.out.decode("utf-8", "replace")
             .replace(token, "[redacted]")

@@ -15,6 +15,22 @@ from balebot.services.keys import Deleter, KeyService
 from balebot.services.model_client import ModelClient, ModelError
 from balebot.services.reply import Reply
 
+BUTTON_COMMANDS: dict[str, str] = {
+    "شروع مجدد": "/start",
+    "🔄 گفتگوی تازه": "/new",
+    "گفتگوی تازه": "/new",
+    "📋 منوی اصلی": "/menu",
+    "منوی اصلی": "/menu",
+    "🤖 انتخاب مدل": "/models",
+    "انتخاب مدل": "/models",
+    "🔑 کلیدهای من": "/keys",
+    "کلیدهای من": "/keys",
+    "📊 سهمیه امروز": "/usage",
+    "سهمیه امروز": "/usage",
+    "📖 راهنما": "/help",
+    "راهنما": "/help",
+}
+
 
 async def get_or_create_user(session: AsyncSession, bale_id: int, username: str | None) -> User:
     user = await session.scalar(select(User).where(User.bale_id == bale_id))
@@ -112,6 +128,8 @@ class ChatService:
         on_stage: Callable[[str], Awaitable[None]] | None = None,
     ) -> Reply:
         text = text.strip()
+        if text in BUTTON_COMMANDS:
+            text = BUTTON_COMMANDS[text]
         day = self._today()
         # a pending add-key step may legitimately receive a long secret; its own checks apply
         async with self._sm() as s:
@@ -123,6 +141,28 @@ class ChatService:
         if banned:
             return Reply(texts.BANNED)
         cmd = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
+
+        if cmd == "/think":
+            rest = text.partition(" ")[2].strip()
+            if not rest:
+                return Reply(
+                    "🧠 حالت تفکر و ابزارهای هرمس همیشه فعال است؛ "
+                    "کافی است سوال یا خواستهٔ خود را مستقیماً بنویسید.",
+                    texts.MAIN_MENU_KEYBOARD,
+                )
+            text = rest
+            cmd = ""
+
+        if cmd == "/daily":
+            rest = text.partition(" ")[2].strip()
+            if not rest:
+                return Reply(
+                    "⏰ برای تنظیم یا لغو گزارش روزانه، کافی است به فارسی بنویسید؛ "
+                    "مثلاً: «هر روز ساعت ۸ صبح خلاصه اخبار را برایم بفرست».",
+                    texts.MAIN_MENU_KEYBOARD,
+                )
+            text = rest
+            cmd = ""
 
         if self.keys is not None:
             reply = await self.keys.handle(
@@ -139,11 +179,26 @@ class ChatService:
             )
         if cmd in ("/help", "/guide"):
             return Reply(texts.HELP, texts.MAIN_MENU_KEYBOARD)
-        if cmd == "/menu":
-            return Reply(texts.MENU_TEXT, texts.MAIN_MENU_KEYBOARD)
+        if cmd in ("/menu", "/settings"):
+            return Reply(
+                texts.MENU_TEXT,
+                texts.MAIN_MENU_KEYBOARD,
+                reply_keyboard=texts.BOTTOM_REPLY_KEYBOARD,
+            )
+        if cmd in ("/info", "/status"):
+            usage_str = await self._simple_command(user_id, "/usage", limit, day)
+            return Reply(
+                texts.STATUS_INFO.format(model=selected or cfg.base_model, usage=usage_str),
+                texts.MAIN_MENU_KEYBOARD,
+                reply_keyboard=texts.BOTTOM_REPLY_KEYBOARD,
+            )
         if cmd in ("/start", "/usage", "/new"):
             kb = texts.MAIN_MENU_KEYBOARD if cmd == "/start" else texts.BACK_TO_MENU_KEYBOARD
-            return Reply(await self._simple_command(user_id, cmd, limit, day), kb)
+            return Reply(
+                await self._simple_command(user_id, cmd, limit, day),
+                kb,
+                reply_keyboard=texts.BOTTOM_REPLY_KEYBOARD if cmd == "/start" else None,
+            )
         if not text:
             return Reply(texts.UNSUPPORTED)
 

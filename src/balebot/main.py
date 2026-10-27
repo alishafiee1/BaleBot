@@ -9,6 +9,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
 
+from balebot import texts
 from balebot.api import admin
 from balebot.config import Settings, get_settings
 from balebot.db import create_all, make_engine, make_sessionmaker
@@ -73,6 +74,10 @@ def create_app(state: AppState | None = None) -> FastAPI:
         configure_logging()
         app.state.ctx = state or build_state(settings)
         await create_all(app.state.ctx.engine)
+        try:
+            await app.state.ctx.bale.set_my_commands(texts.BOT_COMMANDS)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("balebot").warning("set_my_commands failed: %s", exc)
         yield
         await app.state.ctx.engine.dispose()
 

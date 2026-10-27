@@ -5,6 +5,7 @@ import asyncio
 
 from sqlalchemy import select
 
+from balebot import texts
 from balebot.config import get_settings
 from balebot.db import create_all
 from balebot.gateway.updates import process_update
@@ -49,6 +50,7 @@ async def set_webhook() -> None:
     state = build_state(cfg)
     url = f"{cfg.webhook_base_url.rstrip('/')}/bale/webhook/{cfg.webhook_secret}"
     print("webhook set:", await state.bale.set_webhook(url))
+    print("commands set:", await state.bale.set_my_commands(texts.BOT_COMMANDS))
 
 
 async def poll() -> None:

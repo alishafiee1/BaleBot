@@ -16,6 +16,14 @@ async def _send(
     reply: Reply,
     progress_msg_id: int | None = None,
 ) -> None:
+    if reply.reply_keyboard is not None:
+        try:
+            await state.bale.send_reply_keyboard(
+                chat_id, texts.KEYBOARD_READY, reply.reply_keyboard
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("send_reply_keyboard failed: %s", exc)
+
     chunks = [
         reply.text[i : i + MAX_MESSAGE]
         for i in range(0, max(len(reply.text), 1), MAX_MESSAGE)

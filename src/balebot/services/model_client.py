@@ -28,8 +28,8 @@ def _extract_reply_text(data: dict[str, Any]) -> str:
 def _zai_fallbacks(base_url: str, model: str) -> list[str]:
     if "api.z.ai" not in base_url:
         return [model]
-    primary = "glm-4.7-flash" if model == "glm-4.5-flash" else model
-    return [primary, "glm-4.7-flash", "glm-4.7-flash", "glm-4.5-flash"]
+    alt = "glm-4.7-flash" if model == "glm-4.5-flash" else "glm-4.5-flash"
+    return [model, alt, model, alt]
 
 
 class OpenAICompatClient:

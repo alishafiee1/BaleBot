@@ -114,3 +114,51 @@ async def test_help_and_menu_commands_and_callbacks(state: AppState, model) -> N
     await state.chat.handle_message(1, "ali", "/start")
     chat_reply = await state.chat.handle_message(1, "ali", "سلام خوبی؟")
     assert chat_reply.text.startswith("echo:")
+
+
+async def test_button_commands_and_legacy_commands(state: AppState, model) -> None:
+    # Bottom persistent keyboard button presses
+    r_restart = await state.chat.handle_message(1, "ali", "شروع مجدد")
+    assert "سلام" in r_restart.text
+    assert r_restart.keyboard == texts.MAIN_MENU_KEYBOARD
+    assert r_restart.reply_keyboard == texts.BOTTOM_REPLY_KEYBOARD
+
+    r_menu_btn = await state.chat.handle_message(1, "ali", "📋 منوی اصلی")
+    assert r_menu_btn.text == texts.MENU_TEXT
+    assert r_menu_btn.reply_keyboard == texts.BOTTOM_REPLY_KEYBOARD
+
+    r_new_btn = await state.chat.handle_message(1, "ali", "🔄 گفتگوی تازه")
+    assert r_new_btn.text == texts.NEW_CHAT
+
+    r_models_btn = await state.chat.handle_message(1, "ali", "🤖 انتخاب مدل")
+    assert texts.MODELS_HEADER in r_models_btn.text
+
+    r_keys_btn = await state.chat.handle_message(1, "ali", "🔑 کلیدهای من")
+    assert r_keys_btn.text == texts.NO_KEYS
+
+    r_usage_btn = await state.chat.handle_message(1, "ali", "📊 سهمیه امروز")
+    assert "مصرف امروز" in r_usage_btn.text
+
+    r_help_btn = await state.chat.handle_message(1, "ali", "📖 راهنما")
+    assert r_help_btn.text == texts.HELP
+
+    # Legacy slash commands from old bot
+    r_settings = await state.chat.handle_message(1, "ali", "/settings")
+    assert r_settings.text == texts.MENU_TEXT
+    assert r_settings.reply_keyboard == texts.BOTTOM_REPLY_KEYBOARD
+
+    r_info = await state.chat.handle_message(1, "ali", "/info")
+    assert "وضعیت ربات" in r_info.text
+    assert r_info.reply_keyboard == texts.BOTTOM_REPLY_KEYBOARD
+
+    r_status = await state.chat.handle_message(1, "ali", "/status")
+    assert "وضعیت سرور" in r_status.text
+
+    r_think_empty = await state.chat.handle_message(1, "ali", "/think")
+    assert "حالت تفکر" in r_think_empty.text
+
+    r_think_q = await state.chat.handle_message(1, "ali", "/think سلام دنیا")
+    assert r_think_q.text.startswith("echo:سلام دنیا")
+
+    r_daily_empty = await state.chat.handle_message(1, "ali", "/daily")
+    assert "گزارش روزانه" in r_daily_empty.text

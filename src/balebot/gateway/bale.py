@@ -2,6 +2,8 @@ from typing import Any, Protocol
 
 import httpx
 
+from balebot import texts
+
 MAX_MESSAGE = 3500
 
 
@@ -16,6 +18,10 @@ class BaleApi(Protocol):
         text: str,
         keyboard: list[list[dict[str, str]]] | None = None,
     ) -> bool: ...
+    async def send_reply_keyboard(
+        self, chat_id: int, text: str, reply_keyboard: list[list[dict[str, str]]]
+    ) -> int | None: ...
+    async def set_my_commands(self, commands: list[dict[str, str]] | None = None) -> bool: ...
     async def delete_message(self, chat_id: int, message_id: int) -> None: ...
     async def send_document(self, chat_id: int, name: str, data: bytes) -> None: ...
     async def answer_callback(self, callback_id: str) -> None: ...
@@ -72,6 +78,35 @@ class BaleClient:
         try:
             resp = await self._call("editMessageText", payload, timeout=20.0)
             return bool(isinstance(resp, dict) and resp.get("ok"))
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def send_reply_keyboard(
+        self, chat_id: int, text: str, reply_keyboard: list[list[dict[str, str]]]
+    ) -> int | None:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text[:MAX_MESSAGE],
+            "reply_markup": {"keyboard": reply_keyboard, "resize_keyboard": True},
+        }
+        try:
+            resp = await self._call("sendMessage", payload, timeout=20.0)
+            if isinstance(resp, dict):
+                mid = resp.get("result", {}).get("message_id")
+                if mid is not None:
+                    try:
+                        return int(mid)
+                    except (ValueError, TypeError):
+                        pass
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    async def set_my_commands(self, commands: list[dict[str, str]] | None = None) -> bool:
+        cmds = commands if commands is not None else texts.BOT_COMMANDS
+        try:
+            data = await self._call("setMyCommands", {"commands": cmds}, timeout=15.0)
+            return bool(isinstance(data, dict) and data.get("ok"))
         except Exception:  # noqa: BLE001
             return False
 

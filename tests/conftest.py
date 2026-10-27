@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 import pytest
 
+from balebot import texts
 from balebot.config import Settings
 from balebot.db import create_all
 from balebot.main import build_state
@@ -50,6 +51,8 @@ class FakeBale:
         self.sent: list[Any] = []
         self.keyboards: list = []
         self.edited: list[tuple[int, int, str, Any]] = []
+        self.reply_keyboards: list[tuple[int, str, Any]] = []
+        self.commands: list[dict[str, str]] = []
         self.deleted: list[tuple[int, int]] = []
         self.documents: list[tuple[int, str, bytes]] = []
         self.actions: list[tuple[int, str]] = []
@@ -72,6 +75,16 @@ class FakeBale:
             self.sent[message_id - 1] = SentTuple(chat_id, text, keyboard)
             return True
         return False
+
+    async def send_reply_keyboard(
+        self, chat_id: int, text: str, reply_keyboard: list[list[dict[str, str]]]
+    ) -> int | None:
+        self.reply_keyboards.append((chat_id, text, reply_keyboard))
+        return 1
+
+    async def set_my_commands(self, commands: list[dict[str, str]] | None = None) -> bool:
+        self.commands = commands or texts.BOT_COMMANDS
+        return True
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         self.deleted.append((chat_id, message_id))

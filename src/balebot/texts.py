@@ -125,6 +125,32 @@ AGENT_FAILED = "اجرای کار ناموفق بود. این کار از سهم
 AGENT_TIMEOUT = "زمان اجرا تمام شد و کار نیمه‌کاره ماند. کار را کوچک‌تر کنید و دوباره تلاش کنید."
 AGENT_EMPTY = "(بدون خروجی متنی)"
 
+KEYBOARD_READY = "⌨️ منوی دسترسی سریع پایین صفحه آماده است."
+STATUS_INFO = (
+    "📡 وضعیت ربات و محیط هرمس:\n"
+    "• وضعیت سرور: 🟢 فعال و آماده\n"
+    "• محیط لینوکس اختصاصی: 🟢 فعال (Hermes Sandbox)\n"
+    "• مدل انتخابی: {model}\n"
+    "• {usage}"
+)
+
+# ---- bot commands menu ----
+BOT_COMMANDS: list[dict[str, str]] = [
+    {"command": "new", "description": "شروع گفتگوی تازه و پاک کردن حافظه"},
+    {"command": "menu", "description": "نمایش منوی اصلی و امکانات ربات"},
+    {"command": "models", "description": "مشاهده و تغییر مدل هوش مصنوعی"},
+    {"command": "keys", "description": "مدیریت و ثبت کلید API شخصی"},
+    {"command": "usage", "description": "مشاهده سهمیه و مصرف امروز"},
+    {"command": "help", "description": "راهنمای کامل کار با دستیار هرمس"},
+]
+
+# ---- bottom reply keyboard ----
+BOTTOM_REPLY_KEYBOARD: list[list[dict[str, str]]] = [
+    [{"text": "🔄 گفتگوی تازه"}, {"text": "📋 منوی اصلی"}],
+    [{"text": "🤖 انتخاب مدل"}, {"text": "🔑 کلیدهای من"}],
+    [{"text": "📊 سهمیه امروز"}, {"text": "📖 راهنما"}],
+]
+
 # ---- inline keyboards ----
 MAIN_MENU_KEYBOARD: list[list[dict[str, str]]] = [
     [
