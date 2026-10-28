@@ -1,4 +1,6 @@
+import asyncio
 import base64
+import contextlib
 import os
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta
@@ -322,6 +324,10 @@ class ChatService:
         )
 
         if media.kind == "photo":
+            if progress:
+                await progress(
+                    "🔍 تصویر دریافت شد؛ در حال تحلیل جزئیات و متن تصویر با هوش مصنوعی..."
+                )
             caption = text.removeprefix("/agent").strip() or (
                 "این تصویر را با دقت بررسی و تحلیل کن "
                 "و تمام جزئیات یا متن داخل آن را به فارسی توضیح بده."
@@ -369,20 +375,47 @@ class ChatService:
                     input_files=input_files,
                 )
 
-            return await self._direct_chat(
-                user_id,
-                selected,
-                caption,
-                cfg,
-                limit,
-                day,
-                user_content=multimodal_content,
-                stored_user_text=f"[تصویر ارسالی: {media.filename}] {caption}",
-            )
+            photo_ticker: asyncio.Task[None] | None = None
+            if on_stage is not None:
+
+                async def _photo_tick() -> None:
+                    elapsed = 0
+                    while True:
+                        await asyncio.sleep(5.0)
+                        elapsed += 5
+                        with contextlib.suppress(Exception):
+                            await on_stage(
+                                "🔍 در حال تحلیل دقیق تصویر و آماده‌سازی پاسخ... "
+                                f"(⏱ {elapsed} ثانیه)"
+                            )
+
+                photo_ticker = asyncio.create_task(_photo_tick())
+            try:
+                return await self._direct_chat(
+                    user_id,
+                    selected,
+                    caption,
+                    cfg,
+                    limit,
+                    day,
+                    user_content=multimodal_content,
+                    stored_user_text=f"[تصویر ارسالی: {media.filename}] {caption}",
+                )
+            finally:
+                if photo_ticker is not None:
+                    photo_ticker.cancel()
 
         if media.kind in ("voice", "audio"):
+            if progress:
+                await progress("🎤 پیام صوتی دریافت شد؛ در حال تبدیل گفتار به متن...")
             ext = os.path.splitext(media.filename)[1].lstrip(".") or "ogg"
             transcript = await transcribe_audio_bytes(media.data, ext=ext)
+            if on_stage and transcript:
+                with contextlib.suppress(Exception):
+                    await on_stage(
+                        f"🎤 متن ویس تشخیص داده شد: «{transcript[:80]}»\n"
+                        "🧠 در حال تفکر و آماده‌سازی پاسخ..."
+                    )
             clean_caption = text.removeprefix("/agent").strip()
             if not transcript and not clean_caption:
                 if has_sandbox and self._settings.unified_hermes:
@@ -443,6 +476,8 @@ class ChatService:
             return reply
 
         # document
+        if progress:
+            await progress(f"📎 فایل «{media.filename}» دریافت شد؛ در حال بررسی و پردازش...")
         clean_caption = (
             text.removeprefix("/agent").strip() or "محتوای این فایل را بررسی و تحلیل کن."
         )

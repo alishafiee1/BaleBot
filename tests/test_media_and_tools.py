@@ -194,3 +194,28 @@ async def test_proxy_vision_extract_and_audio_endpoints(
         )
         assert r_stt.status_code == 200
         assert r_stt.json() == {"ok": True, "text": "متن تست صوتی"}
+
+
+async def test_photo_update_sends_and_replaces_progress_message(agent_state, bale) -> None:
+    from balebot.gateway.updates import process_update
+
+    async def fake_get_file(file_id: str) -> tuple[bytes, str]:
+        return b"\x89PNG\r\n\x1a\nfake", "photos/img1.png"
+
+    bale.get_file = fake_get_file  # type: ignore[method-assign]
+    update = {
+        "update_id": 999,
+        "message": {
+            "message_id": 10,
+            "chat": {"id": 77},
+            "from": {"id": 77, "username": "tester"},
+            "photo": [{"file_id": "fid-1", "width": 100, "height": 100}],
+        },
+    }
+    await process_update(agent_state, update)
+    # One send_message (initial progress bubble), then edited in place with the final answer
+    assert len(bale.sent) == 1
+    assert "echo:" in bale.sent[0][1]
+    assert len(bale.edited) >= 2
+    assert "🔍 تصویر دریافت شد" in bale.edited[0][2]
+    assert "echo:" in bale.edited[-1][2]

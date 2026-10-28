@@ -164,13 +164,21 @@ async def _message(state: AppState, message: dict[str, Any]) -> None:
 
     async def progress(note: str) -> None:
         nonlocal progress_msg_id, last_edit_ts
-        progress_msg_id = await state.bale.send_message(chat_id, note)
+        if progress_msg_id is not None:
+            edited = await state.bale.edit_message(chat_id, progress_msg_id, note)
+            if not edited:
+                progress_msg_id = await state.bale.send_message(chat_id, note)
+        else:
+            progress_msg_id = await state.bale.send_message(chat_id, note)
         last_edit_ts = time.monotonic()
 
     async def on_stage(stage_text: str) -> None:
-        nonlocal last_edit_ts
+        nonlocal progress_msg_id, last_edit_ts
         if progress_msg_id is not None:
             await state.bale.edit_message(chat_id, progress_msg_id, stage_text)
+            last_edit_ts = time.monotonic()
+        else:
+            progress_msg_id = await state.bale.send_message(chat_id, stage_text)
             last_edit_ts = time.monotonic()
 
     stripped = (text or "").strip()
@@ -183,12 +191,32 @@ async def _message(state: AppState, message: dict[str, Any]) -> None:
 
     media: IncomingMedia | None = None
     if has_media:
+        raw_doc = message.get("document")
+        doc_obj: dict[str, Any] = raw_doc if isinstance(raw_doc, dict) else {}
+        doc_mime = str(doc_obj.get("mime_type") or "")
+        doc_name = str(doc_obj.get("file_name") or "").lower()
+        if (
+            "photo" in message
+            or doc_mime.startswith("image/")
+            or doc_name.endswith((".jpg", ".jpeg", ".png", ".webp"))
+        ):
+            initial_note = "🖼 تصویر دریافت شد؛ در حال دانلود و تحلیل بصری تصویر..."
+        elif "voice" in message or "audio" in message or doc_mime.startswith("audio/"):
+            initial_note = "🎤 پیام صوتی دریافت شد؛ در حال دانلود و تبدیل گفتار به متن..."
+        else:
+            initial_note = "📎 فایل دریافت شد؛ در حال دانلود و بررسی محتوا..."
+        try:
+            await progress(initial_note)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("initial media progress failed: %s", type(exc).__name__)
         try:
             media = await _extract_media(state, message)
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to download incoming media: %s", type(exc).__name__)
             if not stripped:
-                await _send(state, chat_id, Reply(texts.MODEL_ERROR))
+                await _send(
+                    state, chat_id, Reply(texts.MODEL_ERROR), progress_msg_id=progress_msg_id
+                )
                 return
 
     reply = await state.chat.handle_message(
