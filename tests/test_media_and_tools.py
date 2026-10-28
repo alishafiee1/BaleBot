@@ -36,8 +36,7 @@ def test_vision_model_fallback_selection() -> None:
 
 def test_extract_html_text_and_sanitize() -> None:
     raw = (
-        b"<html><head><title>Test Page</title></head>"
-        b"<body><h1>Hello</h1><p>World</p></body></html>"
+        b"<html><head><title>Test Page</title></head><body><h1>Hello</h1><p>World</p></body></html>"
     )
     title, text = extract_html_text(raw)
     assert title == "Test Page"

@@ -361,7 +361,7 @@ class ChatService:
                 return await self._agent(
                     user_id,
                     selected,
-                    f"/agent {agent_task[:self._settings.max_input_chars]}",
+                    f"/agent {agent_task[: self._settings.max_input_chars]}",
                     limit,
                     day,
                     progress,
@@ -417,7 +417,7 @@ class ChatService:
                 reply = await self._agent(
                     user_id,
                     selected,
-                    f"/agent {agent_task[:self._settings.max_input_chars]}",
+                    f"/agent {agent_task[: self._settings.max_input_chars]}",
                     limit,
                     day,
                     progress,
@@ -455,7 +455,7 @@ class ChatService:
             reply = await self._agent(
                 user_id,
                 selected,
-                f"/agent {agent_task[:self._settings.max_input_chars]}",
+                f"/agent {agent_task[: self._settings.max_input_chars]}",
                 limit,
                 day,
                 progress,

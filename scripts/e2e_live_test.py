@@ -197,7 +197,9 @@ class SpyBale:
         self.actions.append((chat_id, action))
 
     async def get_updates(
-        self, offset: int, timeout: int = 30  # noqa: ASYNC109
+        self,
+        offset: int,
+        timeout: int = 30,  # noqa: ASYNC109
     ) -> list[dict[str, Any]]:
         return []
 
@@ -219,27 +221,17 @@ class SmartTestModel:
         model: str,
         messages: list[dict[str, str]],
     ) -> str:
-        self.calls.append(
-            {"base_url": base_url, "model": model, "messages": list(messages)}
-        )
-        history_text = "\n".join(
-            m["content"] for m in messages if m["role"] != "system"
-        )
+        self.calls.append({"base_url": base_url, "model": model, "messages": list(messages)})
+        history_text = "\n".join(m["content"] for m in messages if m["role"] != "system")
         last_user = messages[-1]["content"]
-        if (
-            "پروژه کهکشان ۴۲" in history_text
-            and "اسم رمز تست امروز ما چی بود" not in last_user
-        ):
+        if "پروژه کهکشان ۴۲" in history_text and "اسم رمز تست امروز ما چی بود" not in last_user:
             return (
                 "سلام! اسم رمز «پروژه کهکشان ۴۲» را به خاطر سپردم. "
                 "من در پیام‌رسان بله در خدمت شما هستم."
             )
         if "اسم رمز" in last_user:
             if "پروژه کهکشان ۴۲" in history_text:
-                return (
-                    "اسم رمز تست امروز ما «پروژه کهکشان ۴۲» بود که در "
-                    "پیام‌رسان بله به من گفتید."
-                )
+                return "اسم رمز تست امروز ما «پروژه کهکشان ۴۲» بود که در پیام‌رسان بله به من گفتید."
             return "در گفتگوی فعلی ما در بله، هنوز اسم رمزی به من نگفته‌اید."
         return f"پاسخ تست در پیام‌رسان بله: {last_user}"
 
@@ -339,9 +331,7 @@ def discover_webhook_secret(env_file: Path) -> str | None:
     file_env = load_env_file(env_file)
     if s := file_env.get("BALEBOT_WEBHOOK_SECRET"):
         return s.strip()
-    rc, out, _ = _run_sync(
-        "journalctl", "-u", "balebot.service", "-n", "1000", "--no-pager"
-    )
+    rc, out, _ = _run_sync("journalctl", "-u", "balebot.service", "-n", "1000", "--no-pager")
     if rc == 0:
         matches = re.findall(r"POST /bale/webhook/([A-Za-z0-9_-]{16,128})", out)
         for candidate in reversed(matches):
@@ -354,12 +344,11 @@ def discover_bale_user_id(db_path: Path, fallback: int) -> int:
     if db_path.is_file() and os.access(db_path, os.R_OK):
         with contextlib.suppress(sqlite3.Error, ValueError):
             with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
-                row = conn.execute(
-                    "SELECT bale_id FROM users ORDER BY id ASC LIMIT 1"
-                ).fetchone()
+                row = conn.execute("SELECT bale_id FROM users ORDER BY id ASC LIMIT 1").fetchone()
                 if row and row[0]:
                     return int(row[0])
     return fallback
+
 
 def _read_db_counts(db_path: Path) -> dict[str, int] | None:
     if not (db_path.is_file() and os.access(db_path, os.R_OK)):
@@ -394,9 +383,7 @@ async def run_full_suite(
     def mock_provider(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/models"):
             return httpx.Response(200, json={"data": [{"id": "gpt-4o-mini"}]})
-        return httpx.Response(
-            200, json={"choices": [{"message": {"content": "ok"}}]}
-        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
 
     settings = Settings(
         database_url="sqlite+aiosqlite://",
@@ -411,9 +398,7 @@ async def run_full_suite(
         _env_file=None,
     )
     http = SafeHttp(transport=httpx.MockTransport(mock_provider))
-    state = build_state(
-        settings, model_client=model, bale=bale, http=http, incus=incus
-    )
+    state = build_state(settings, model_client=model, bale=bale, http=http, incus=incus)
     incus.state = state
     app = create_app(state)
     hook_path = f"/bale/webhook/{suite_hook}"
@@ -589,11 +574,7 @@ async def run_full_suite(
             await client.post(hook_path, json=make_msg(q1))
             dt1 = (time.perf_counter() - t0) * 1000
             ans1 = bale.sent[-1][1]
-            ok1 = (
-                "بله" in ans1
-                and "بیل" not in ans1
-                and (uid, "typing") in bale.actions
-            )
+            ok1 = "بله" in ans1 and "بیل" not in ans1 and (uid, "typing") in bale.actions
             report.record(
                 "Scenario 4 (AI Chat & Memory)",
                 "Turn 1: Introduce code name + verify Persian 'بله' (never 'بیل') + typing action",
@@ -618,9 +599,7 @@ async def run_full_suite(
 
             t0 = time.perf_counter()
             await client.post(hook_path, json=make_msg("/new"))
-            await client.post(
-                hook_path, json=make_msg("اسم رمز تست قبلی یادت هست؟")
-            )
+            await client.post(hook_path, json=make_msg("اسم رمز تست قبلی یادت هست؟"))
             dt3 = (time.perf_counter() - t0) * 1000
             ans3 = bale.sent[-1][1]
             last_llm_msgs = model.calls[-1]["messages"]
@@ -752,9 +731,7 @@ async def run_full_suite(
 
             # --- Scenario 7: Security, Duplicate update_id & Quota Resilience ---
             t0 = time.perf_counter()
-            r_bad_sec = await client.post(
-                "/bale/webhook/wrong-secret", json=make_msg("hi")
-            )
+            r_bad_sec = await client.post("/bale/webhook/wrong-secret", json=make_msg("hi"))
             dup_payload = make_msg("پیام تست تکراری")
             sent_before = len(bale.sent)
             r_dup1 = await client.post(hook_path, json=dup_payload)
@@ -925,9 +902,7 @@ async def check_live_server_health(
         report.server_health["systemd"] = statuses
 
     if shutil.which("incus"):
-        rc, out, _ = await _run_async(
-            "incus", "--project", "balebot", "list", "--format=json"
-        )
+        rc, out, _ = await _run_async("incus", "--project", "balebot", "list", "--format=json")
         if rc == 0:
             with contextlib.suppress(ValueError):
                 items = json.loads(out)
@@ -1242,9 +1217,7 @@ async def run_live_chat(
         report.record(
             "Live Scenario 7 (Security & Idempotency)",
             "Live webhook invalid secret (404) & duplicate update_id check",
-            r_bad.status_code == 404
-            and r_d1.status_code == 200
-            and r_d2.status_code == 200,
+            r_bad.status_code == 404 and r_d1.status_code == 200 and r_d2.status_code == 200,
             dt_sec,
             dup_detail,
         )
@@ -1261,9 +1234,7 @@ async def async_main() -> int:
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--public-url", default="https://node.roditeam.ir")
     parser.add_argument("--env-file", type=Path, default=Path("/etc/balebot/env"))
-    parser.add_argument(
-        "--db-path", type=Path, default=Path("/var/lib/balebot/balebot.db")
-    )
+    parser.add_argument("--db-path", type=Path, default=Path("/var/lib/balebot/balebot.db"))
     parser.add_argument("--bale-user-id", type=int, default=0)
     parser.add_argument("--json-out", type=Path, default=None)
     args = parser.parse_args()
@@ -1275,9 +1246,7 @@ async def async_main() -> int:
     )
 
     secret = discover_webhook_secret(args.env_file)
-    bale_uid = args.bale_user_id or discover_bale_user_id(
-        args.db_path, DEFAULT_BALE_USER_ID
-    )
+    bale_uid = args.bale_user_id or discover_bale_user_id(args.db_path, DEFAULT_BALE_USER_ID)
 
     if args.mode in ("full-suite", "all"):
         await run_full_suite(

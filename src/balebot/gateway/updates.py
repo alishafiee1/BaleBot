@@ -27,8 +27,7 @@ async def _send(
             log.warning("send_reply_keyboard failed: %s", exc)
 
     chunks = [
-        reply.text[i : i + MAX_MESSAGE]
-        for i in range(0, max(len(reply.text), 1), MAX_MESSAGE)
+        reply.text[i : i + MAX_MESSAGE] for i in range(0, max(len(reply.text), 1), MAX_MESSAGE)
     ]
     if progress_msg_id is not None and chunks:
         kb = reply.keyboard if len(chunks) == 1 else None
@@ -81,9 +80,7 @@ async def _extract_media(state: AppState, message: dict[str, Any]) -> IncomingMe
             data, file_path = await state.bale.get_file(str(best["file_id"]))
             ext = os.path.splitext(file_path)[1].lower() or ".jpg"
             mime = (
-                "image/png"
-                if ext == ".png"
-                else ("image/webp" if ext == ".webp" else "image/jpeg")
+                "image/png" if ext == ".png" else ("image/webp" if ext == ".webp" else "image/jpeg")
             )
             return IncomingMedia(
                 kind="photo",
@@ -145,9 +142,7 @@ async def _message(state: AppState, message: dict[str, Any]) -> None:
     raw_text = message.get("text")
     caption = message.get("caption")
     text = (
-        raw_text
-        if isinstance(raw_text, str)
-        else (caption if isinstance(caption, str) else None)
+        raw_text if isinstance(raw_text, str) else (caption if isinstance(caption, str) else None)
     )
     has_media = any(k in message for k in ("photo", "voice", "audio", "document"))
     if text is None and not has_media:

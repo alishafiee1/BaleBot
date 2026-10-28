@@ -347,7 +347,6 @@ class SandboxManager:
             stdin=web_search_script.encode(),
         )  # fmt: skip
 
-
         extract_url = f"{s.proxy_url.rstrip('/')}/web/extract"
         web_extract_script = (
             "#!/usr/bin/env python3\n"
@@ -456,9 +455,11 @@ class SandboxManager:
             "    with urllib.request.urlopen(req, timeout=60) as r:\n"
             "        data = json.loads(r.read().decode())\n"
             "        print(data.get('text', ''))\n"
-            "except Exception as e:\n"
-            "    print(f'STT error: {e}', file=sys.stderr)\n"
-            "    sys.exit(1)\n"
+            "except Exception:\n"
+            "    sys.path.insert(0, '/home/agent/.hermes/hermes-agent')\n"
+            "    from tools.transcription_tools import _balebot_google_stt_file\n"
+            "    res = _balebot_google_stt_file(path, lang)\n"
+            "    print(res.get('text', ''))\n"
         )
         await self._incus.run(
             "file", "push", "-", f"{name}{HOME}/.local/bin/balebot-stt",
@@ -471,9 +472,7 @@ class SandboxManager:
             stdin=HERMES_PATCH_SCRIPT.encode(),
         )  # fmt: skip
         await self._incus.run(
-            *self._as_agent(
-                name, "python3", f"{HOME}/.local/bin/balebot-patch-hermes"
-            )
+            *self._as_agent(name, "python3", f"{HOME}/.local/bin/balebot-patch-hermes")
         )
 
         if on_stage:

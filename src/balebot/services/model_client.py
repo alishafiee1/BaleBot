@@ -3,6 +3,8 @@ from typing import Any, Protocol
 
 import httpx
 
+from balebot.services.media import describe_image_fallback
+
 
 class ModelError(Exception):
     """The model backend failed; the caller must not charge the user's quota."""
@@ -35,11 +37,39 @@ def _has_image_content(messages: list[dict[str, Any]]) -> bool:
     return False
 
 
+async def rewrite_vision_messages_for_text_fallback(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Convert multimodal image messages into text-only messages using OCR + visual metadata."""
+    rewritten: list[dict[str, Any]] = []
+    for m in messages:
+        content = m.get("content")
+        if not isinstance(content, list):
+            rewritten.append(m)
+            continue
+        text_parts: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get("type")
+            if ptype == "text":
+                t = str(part.get("text") or "").strip()
+                if t:
+                    text_parts.append(t)
+            elif ptype in ("image_url", "image"):
+                img_obj = part.get("image_url")
+                url = img_obj.get("url", "") if isinstance(img_obj, dict) else str(img_obj or "")
+                meta = await describe_image_fallback(url)
+                text_parts.append(f"[اطلاعات استخراج‌شده از تصویر (OCR و مشخصات بصری)]:\n{meta}")
+        rewritten.append({**m, "content": "\n\n".join(text_parts)})
+    return rewritten
+
+
 def _zai_fallbacks(base_url: str, model: str, *, vision: bool = False) -> list[str]:
     if "api.z.ai" not in base_url:
         return [model]
     if vision:
-        return ["glm-4.6v-flash", "glm-4v-flash", "glm-4.6v-flash"]
+        return ["glm-4.6v-flash", "glm-4.6v-flash"]
     alt = "glm-4.7-flash" if model == "glm-4.5-flash" else "glm-4.5-flash"
     return [model, alt, model, alt]
 
@@ -79,10 +109,33 @@ class OpenAICompatClient:
                 last_exc = exc
                 if idx + 1 < len(candidates):
                     continue
+                if has_vision and is_zai:
+                    break
                 # type only: the message/URL could carry a key
                 raise ModelError(type(exc).__name__) from None
             if content:
                 return str(content)
+
+        if has_vision and is_zai:
+            try:
+                fallback_msgs = await rewrite_vision_messages_for_text_fallback(messages)
+                fallback_model = "glm-4.7-flash" if model == "glm-4.6v-flash" else model
+                resp = await self._http.post(
+                    url,
+                    headers=headers,
+                    json={
+                        "model": fallback_model,
+                        "messages": fallback_msgs,
+                        "thinking": {"type": "disabled"},
+                    },
+                )
+                resp.raise_for_status()
+                content = _extract_reply_text(resp.json())
+                if content:
+                    return str(content)
+            except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError) as exc:
+                last_exc = exc
+
         if last_exc is not None:
             raise ModelError(type(last_exc).__name__) from None
         raise ModelError("empty reply")

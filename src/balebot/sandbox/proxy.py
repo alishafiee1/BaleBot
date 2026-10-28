@@ -32,7 +32,12 @@ from balebot.services.media import (
     synthesize_speech_bytes,
     transcribe_audio_bytes,
 )
-from balebot.services.model_client import ModelError, _has_image_content, _zai_fallbacks
+from balebot.services.model_client import (
+    ModelError,
+    _has_image_content,
+    _zai_fallbacks,
+    rewrite_vision_messages_for_text_fallback,
+)
 from balebot.state import AppState
 
 log = logging.getLogger("balebot.sandbox.proxy")
@@ -53,9 +58,7 @@ ALLOWED = {
 
 
 def _error(status: int, message: str) -> JSONResponse:
-    return JSONResponse(
-        {"error": {"message": message, "type": "proxy_error"}}, status_code=status
-    )
+    return JSONResponse({"error": {"message": message, "type": "proxy_error"}}, status_code=status)
 
 
 async def to_sse(data: dict[str, Any]) -> AsyncIterator[bytes]:
@@ -84,11 +87,7 @@ async def to_sse(data: dict[str, Any]) -> AsyncIterator[bytes]:
         }
         yield f"data: {json.dumps(chunk_text)}\n\n".encode()
     if msg.get("tool_calls"):
-        tcs = [
-            {"index": i, **tc}
-            for i, tc in enumerate(msg["tool_calls"])
-            if isinstance(tc, dict)
-        ]
+        tcs = [{"index": i, **tc} for i, tc in enumerate(msg["tool_calls"]) if isinstance(tc, dict)]
         chunk_tc = {
             **base,
             "choices": [
@@ -279,6 +278,29 @@ def create_proxy_app(state: AppState) -> FastAPI:
                             break
                     if res.status not in (429, 500, 502, 503, 504) or idx + 1 >= len(candidates):
                         break
+                if parsed_data is None and has_vision and is_zai:
+                    fallback_msgs = await rewrite_vision_messages_for_text_fallback(messages)
+                    fb_body: dict[str, Any] = {
+                        **clean,
+                        "messages": fallback_msgs,
+                        "model": cfg.base_model,
+                        "stream": False,
+                        "thinking": {"type": "disabled"},
+                    }
+                    fb_body.pop("tools", None)
+                    fb_body.pop("tool_choice", None)
+                    res = await state.http.request(
+                        "POST",
+                        url,
+                        headers={"Authorization": "Bearer " + state.settings.base_model_api_key},
+                        json=fb_body,
+                        timeout=45.0,
+                    )
+                    if res.status == 200:
+                        loaded = json.loads(res.body)
+                        if isinstance(loaded, dict):
+                            parsed_data = loaded
+
                 if parsed_data is None:
                     if res is not None and res.status != 200:
                         return _error(502, f"upstream status {res.status}")
