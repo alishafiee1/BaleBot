@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -26,6 +27,7 @@ class AppState:
     http: SafeHttp
     sandbox: SandboxManager | None = None
     seen_updates: OrderedDict[tuple[str, str], None] = field(default_factory=OrderedDict)
+    bg_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
 
     def claim_update(self, update: dict[str, Any]) -> bool:
         """Return True on first sight of (update_id, payload), False on duplicate delivery."""

@@ -8,6 +8,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from balebot import texts
@@ -50,9 +51,14 @@ _PHOTO_SANDBOX_HINTS = (
 async def get_or_create_user(session: AsyncSession, bale_id: int, username: str | None) -> User:
     user = await session.scalar(select(User).where(User.bale_id == bale_id))
     if user is None:
-        user = User(bale_id=bale_id, username=username)
-        session.add(user)
-        await session.flush()
+        try:
+            async with session.begin_nested():
+                user = User(bale_id=bale_id, username=username)
+                session.add(user)
+                await session.flush()
+        except IntegrityError:
+            user = await session.scalar(select(User).where(User.bale_id == bale_id))
+            assert user is not None
     elif username and user.username != username:
         user.username = username
     return user
@@ -534,8 +540,6 @@ class ChatService:
             return Reply(texts.AGENT_USAGE)
         if len(task) > s.max_input_chars:
             return Reply(texts.TOO_LONG.format(max=s.max_input_chars))
-        if self.sandbox.is_busy(user_id):
-            return Reply(texts.AGENT_BUSY)
         # runs on the user's own key are free; the free base model pays the agent cost
         own_key = bool(self.keys and await self.keys.resolve(user_id, selected))
         cost = 0 if own_key else s.agent_cost
@@ -546,57 +550,68 @@ class ChatService:
             if not ok:
                 return Reply(texts.AGENT_NO_QUOTA.format(cost=cost))
 
-        async with self._sm() as db:
-            user = await db.get(User, user_id)
-            session_name = (
-                f"bale-{int(user.context_reset_at.timestamp())}"
-                if user and user.context_reset_at
-                else "bale"
-            )
-            history = await self._history(db, user_id)
-
-        prompt_for_agent = task
-        if history:
-            lines = ["[سابقهٔ گفتگوی اخیر با کاربر — برای حفظ زمینهٔ مکالمه:]"]
-            for m in history[-10:]:
-                role_label = "کاربر" if m["role"] == "user" else "دستیار"
-                lines.append(f"{role_label}: {m['content']}")
-            lines.append(f"\n[پیام جدید کاربر که باید الان به آن پاسخ دهی:]\n{task}")
-            prompt_for_agent = "\n".join(lines)
-
-        if progress:
-            await progress(texts.AGENT_RUNNING)
-        token = tokens.issue(
-            s.proxy_secret, user_id, ttl=s.agent_timeout + 120, max_calls=s.agent_max_llm_calls
-        )
+        refunded = False
         try:
-            result = await self.sandbox.run_agent(
-                user_id,
-                prompt_for_agent,
-                token=token,
-                session_name=session_name,
-                on_stage=on_stage,
-                input_files=input_files,
-            )
-        except (SandboxError, OSError):
-            result = None
-        if result is None or (not result.ok and not result.text and not result.timed_out):
-            if cost:
-                async with self._sm() as db:
-                    await quota.refund(db, user_id, day, cost)
-                    await db.commit()
-            return Reply(texts.AGENT_FAILED)
-        text_out = result.text or texts.AGENT_EMPTY
-        if result.timed_out:
-            text_out = f"{text_out}\n\n{texts.AGENT_TIMEOUT}"
-
-        if result.ok:
             async with self._sm() as db:
-                db.add(Message(user_id=user_id, role="user", content=task))
-                db.add(Message(user_id=user_id, role="assistant", content=text_out))
-                await db.commit()
+                user = await db.get(User, user_id)
+                session_name = (
+                    f"bale-{int(user.context_reset_at.timestamp())}"
+                    if user and user.context_reset_at
+                    else "bale"
+                )
+                history = await self._history(db, user_id)
 
-        return Reply(text_out, files=result.files)
+            prompt_for_agent = task
+            if history:
+                lines = ["[سابقهٔ گفتگوی اخیر با کاربر — برای حفظ زمینهٔ مکالمه:]"]
+                for m in history[-10:]:
+                    role_label = "کاربر" if m["role"] == "user" else "دستیار"
+                    lines.append(f"{role_label}: {m['content']}")
+                lines.append(f"\n[پیام جدید کاربر که باید الان به آن پاسخ دهی:]\n{task}")
+                prompt_for_agent = "\n".join(lines)
+
+            if progress:
+                is_queued = self.sandbox.active_count(user_id) >= s.agent_user_max_concurrent
+                await progress(texts.AGENT_QUEUED if is_queued else texts.AGENT_RUNNING)
+            token = tokens.issue(
+                s.proxy_secret, user_id, ttl=s.agent_timeout + 120, max_calls=s.agent_max_llm_calls
+            )
+            try:
+                result = await self.sandbox.run_agent(
+                    user_id,
+                    prompt_for_agent,
+                    token=token,
+                    session_name=session_name,
+                    on_stage=on_stage,
+                    input_files=input_files,
+                )
+            except (SandboxError, OSError):
+                result = None
+            if result is None or (not result.ok and not result.text and not result.timed_out):
+                if cost:
+                    refunded = True
+                    async with self._sm() as db:
+                        await quota.refund(db, user_id, day, cost)
+                        await db.commit()
+                return Reply(texts.AGENT_FAILED)
+            text_out = result.text or texts.AGENT_EMPTY
+            if result.timed_out:
+                text_out = f"{text_out}\n\n{texts.AGENT_TIMEOUT}"
+
+            if result.ok:
+                async with self._sm() as db:
+                    db.add(Message(user_id=user_id, role="user", content=task))
+                    db.add(Message(user_id=user_id, role="assistant", content=text_out))
+                    await db.commit()
+
+            return Reply(text_out, files=result.files)
+        except BaseException:
+            if cost and not refunded:
+                with contextlib.suppress(Exception):
+                    async with self._sm() as db:
+                        await quota.refund(db, user_id, day, cost)
+                        await db.commit()
+            raise
 
     async def _simple_command(self, user_id: int, cmd: str, limit: int, day: date) -> str:
         async with self._sm() as s:

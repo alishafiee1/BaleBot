@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from balebot.models import Base
 
@@ -12,8 +12,16 @@ from balebot.models import Base
 def make_engine(url: str) -> AsyncEngine:
     in_memory = url == "sqlite+aiosqlite://" or ":memory:" in url
     if in_memory:
-        # one shared connection, otherwise every connection sees its own empty database
-        return create_async_engine(url, poolclass=StaticPool)
+        # One persistent connection (so :memory: is shared across sessions) with
+        # queued checkout so concurrent AsyncSessions never share a transaction.
+        return create_async_engine(
+            url,
+            poolclass=AsyncAdaptedQueuePool,
+            pool_size=1,
+            max_overflow=0,
+        )
+    if url.startswith("sqlite"):
+        return create_async_engine(url, connect_args={"timeout": 30})
     return create_async_engine(url)
 
 

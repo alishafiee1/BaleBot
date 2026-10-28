@@ -67,7 +67,9 @@ async def poll() -> None:
             continue
         for u in updates:
             offset = u["update_id"] + 1
-            await process_update(state, u)
+            t = asyncio.create_task(process_update(state, u))
+            state.bg_tasks.add(t)
+            t.add_done_callback(state.bg_tasks.discard)
 
 
 def main() -> None:

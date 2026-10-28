@@ -1,3 +1,4 @@
+import asyncio
 import hmac
 import logging
 import secrets
@@ -115,7 +116,10 @@ def create_app(state: AppState | None = None) -> FastAPI:
             raise HTTPException(400)
         if not ctx.claim_update(update):
             return {"ok": True, "duplicate_ignored": True}
-        background.add_task(process_update, ctx, update)
+        task = asyncio.create_task(process_update(ctx, update))
+        ctx.bg_tasks.add(task)
+        task.add_done_callback(ctx.bg_tasks.discard)
+        await asyncio.wait({task}, timeout=0.25)
         return {"ok": True}
 
     return app

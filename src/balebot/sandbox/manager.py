@@ -7,6 +7,7 @@ pre-built `agent-base` image. Idle containers are stopped; old ones are destroye
 import asyncio
 import contextlib
 import re
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -55,15 +56,30 @@ class SandboxManager:
         self._s = settings
         self._incus = incus
         self._sm = sessionmaker
-        self._locks: dict[int, asyncio.Lock] = {}
+        self._init_locks: dict[int, asyncio.Lock] = {}
+        self._user_semaphores: dict[int, asyncio.Semaphore] = {}
+        self._active_runs: dict[int, int] = {}
         self._slots = asyncio.Semaphore(settings.agent_max_concurrent)
 
+    def active_count(self, user_id: int) -> int:
+        return self._active_runs.get(user_id, 0)
+
     def is_busy(self, user_id: int) -> bool:
-        lock = self._locks.get(user_id)
-        return bool(lock and lock.locked())
+        return self.active_count(user_id) > 0
+
+    def _user_slots(self, user_id: int) -> asyncio.Semaphore:
+        sem = self._user_semaphores.get(user_id)
+        if sem is None:
+            sem = asyncio.Semaphore(max(1, self._s.agent_user_max_concurrent))
+            self._user_semaphores[user_id] = sem
+        return sem
 
     # ---- lifecycle ---------------------------------------------------------------------
     async def ensure(self, user_id: int) -> str:
+        async with self._init_locks.setdefault(user_id, asyncio.Lock()):
+            return await self._ensure_locked(user_id)
+
+    async def _ensure_locked(self, user_id: int) -> str:
         name = sandbox_name(user_id)
         info = await self._incus.run("info", name)
         if not info.ok:
@@ -174,12 +190,12 @@ class SandboxManager:
         on_stage: Callable[[str], Awaitable[None]] | None = None,
         input_files: list[tuple[str, bytes]] | None = None,
     ) -> AgentResult:
-        lock = self._locks.setdefault(user_id, asyncio.Lock())
-        async with lock, self._slots:
-            if on_stage:
-                await on_stage("🔄 مرحله ۱ از ۳: آمادهسازی محیط اختصاصی لینوکس هرمس...")
-            name = await self.ensure(user_id)
-            try:
+        self._active_runs[user_id] = self._active_runs.get(user_id, 0) + 1
+        try:
+            async with self._user_slots(user_id), self._slots:
+                if on_stage:
+                    await on_stage("🔄 مرحله ۱ از ۳: آمادهسازی محیط اختصاصی لینوکس هرمس...")
+                name = await self.ensure(user_id)
                 return await self._run(
                     name,
                     prompt,
@@ -189,20 +205,43 @@ class SandboxManager:
                     on_stage=on_stage,
                     input_files=input_files,
                 )
-            finally:
-                async with self._sm() as s:
-                    row = await s.get(Sandbox, user_id)
-                    if row:
-                        row.last_used = utcnow()
-                        await s.commit()
+        finally:
+            rem = self._active_runs.get(user_id, 1) - 1
+            if rem <= 0:
+                self._active_runs.pop(user_id, None)
+                self._init_locks.pop(user_id, None)
+            else:
+                self._active_runs[user_id] = rem
+            async with self._sm() as s:
+                row = await s.get(Sandbox, user_id)
+                if row:
+                    row.last_used = utcnow()
+                    await s.commit()
 
-    def _as_agent(self, name: str, *cmd: str) -> tuple[str, ...]:
+    def _as_agent(
+        self, name: str, *cmd: str, extra_env: dict[str, str] | None = None
+    ) -> tuple[str, ...]:
+        env_args: list[str] = [
+            "--env",
+            f"HOME={HOME}",
+            "--env",
+            f"PATH={HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin",
+        ]
+        for k, v in (extra_env or {}).items():
+            env_args.extend(["--env", f"{k}={v}"])
         return (
-            "exec", name, "--user", AGENT_UID, "--group", AGENT_UID, "--cwd", HOME,
-            "--env", f"HOME={HOME}",
-            "--env", f"PATH={HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin",
-            "--", *cmd,
-        )  # fmt: skip
+            "exec",
+            name,
+            "--user",
+            AGENT_UID,
+            "--group",
+            AGENT_UID,
+            "--cwd",
+            HOME,
+            *env_args,
+            "--",
+            *cmd,
+        )
 
     async def _run(
         self,
@@ -220,21 +259,31 @@ class SandboxManager:
             tokens.issue_user_token(s.proxy_secret, user_id) if len(s.proxy_secret) >= 16 else token
         )
 
-        # the prompt travels as a file, never on a command line
-        await self._incus.run(
-            *self._as_agent(
-                name,
-                "rm",
-                "-rf",
-                OUTBOX,
-                f"{HOME}/in",
+        run_id = uuid.uuid4().hex[:10]
+        run_dir = f"{HOME}/runs/{run_id}"
+        run_in = f"{run_dir}/in"
+        run_out = f"{run_dir}/out"
+        run_query_path = f"{run_in}/query.txt"
+        solo = self.active_count(user_id) <= 1
+
+        # the prompt travels as a file inside an isolated per-run directory
+        if solo:
+            await self._incus.run(
+                *self._as_agent(
+                    name,
+                    "rm",
+                    "-rf",
+                    OUTBOX,
+                    f"{HOME}/in",
+                )
             )
-        )
         await self._incus.run(
             *self._as_agent(
                 name,
                 "mkdir",
                 "-p",
+                run_in,
+                run_out,
                 OUTBOX,
                 f"{HOME}/in",
                 f"{HOME}/workspace",
@@ -246,20 +295,32 @@ class SandboxManager:
             await on_stage("🧠 مرحله ۲ از ۳: بارگذاری حافظهٔ گفتگو و ارسال به هستهٔ هرمس...")
 
         pushed = await self._incus.run(
-            "file", "push", "-", f"{name}{QUERY_PATH}",
+            "file", "push", "-", f"{name}{run_query_path}",
             "--mode", "0600", "--uid", AGENT_UID, "--gid", AGENT_UID,
             stdin=prompt.encode(),
         )  # fmt: skip
         if not pushed.ok:
             raise SandboxError("could not hand the task to the sandbox")
+        if solo:
+            await self._incus.run(
+                "file", "push", "-", f"{name}{QUERY_PATH}",
+                "--mode", "0600", "--uid", AGENT_UID, "--gid", AGENT_UID,
+                stdin=prompt.encode(),
+            )  # fmt: skip
 
         for raw_fname, file_bytes in input_files or []:
             safe_fname = sanitize_filename(raw_fname)
             await self._incus.run(
-                "file", "push", "-", f"{name}{HOME}/in/{safe_fname}",
+                "file", "push", "-", f"{name}{run_in}/{safe_fname}",
                 "--mode", "0644", "--uid", AGENT_UID, "--gid", AGENT_UID,
                 stdin=file_bytes,
             )  # fmt: skip
+            if solo:
+                await self._incus.run(
+                    "file", "push", "-", f"{name}{HOME}/in/{safe_fname}",
+                    "--mode", "0644", "--uid", AGENT_UID, "--gid", AGENT_UID,
+                    stdin=file_bytes,
+                )  # fmt: skip
 
         await self._incus.run(
             "file", "push", "-", f"{name}{HOME}/.proxy_token",
@@ -389,11 +450,12 @@ class SandboxManager:
         tts_url = f"{s.proxy_url.rstrip('/')}/audio/speech"
         tts_script = (
             "#!/usr/bin/env python3\n"
-            "import json, sys, urllib.request\n\n"
+            "import json, os, sys, urllib.request\n\n"
             f"URL = {tts_url!r}\n"
             f"TOKEN = {user_token!r}\n\n"
             "args = sys.argv[1:]\n"
-            "out_path = '/home/agent/out/voice.mp3'\n"
+            "out_dir = os.environ.get('BALEBOT_OUT_DIR') or '/home/agent/out'\n"
+            "out_path = f'{out_dir}/voice.mp3'\n"
             "last = args[-1] if len(args) >= 2 else ''\n"
             "if last and (last.endswith(('.mp3', '.ogg')) or '/' in last):\n"
             "    out_path = args[-1]\n"
@@ -480,7 +542,7 @@ class SandboxManager:
 
         cmd = [
             "timeout", "-k", "5", str(s.agent_timeout),
-            "hermes", "chat", "--yolo", "-Q", "--oneshot", "--query-file", QUERY_PATH,
+            "hermes", "chat", "--yolo", "-Q", "--oneshot", "--query-file", run_query_path,
             "--provider", "custom", "--base-url", s.proxy_url, "--api-key", token,
             "--model", "balebot", "--max-turns", str(s.agent_max_turns),
             "--ignore-user-config",
@@ -488,6 +550,11 @@ class SandboxManager:
         if s.agent_toolsets.strip():
             cmd += ["-t", s.agent_toolsets.strip()]
 
+        run_env = {
+            "BALEBOT_RUN_ID": run_id,
+            "BALEBOT_IN_DIR": run_in,
+            "BALEBOT_OUT_DIR": run_out,
+        }
         ticker: asyncio.Task[None] | None = None
         if on_stage is not None:
 
@@ -505,43 +572,74 @@ class SandboxManager:
 
             ticker = asyncio.create_task(_tick())
         try:
-            res = await self._incus.run(*self._as_agent(name, *cmd), timeout=s.agent_timeout + 30)
+            try:
+                res = await self._incus.run(
+                    *self._as_agent(name, *cmd, extra_env=run_env),
+                    timeout=s.agent_timeout + 30,
+                )
+            finally:
+                if ticker is not None:
+                    ticker.cancel()
+            text = (
+                res.out.decode("utf-8", "replace")
+                .replace(token, "[redacted]")
+                .replace(user_token, "[redacted]")
+                .strip()
+            )
+            bad_markers = (
+                "Worker execution is unknown",
+                "Execution outcome is unknown",
+                "Unknown execution blocks this session",
+            )
+            has_bad_marker = any(m in text for m in bad_markers)
+            if has_bad_marker:
+                text = ""
+            ok = res.ok and not has_bad_marker
+            timed_out = res.rc in (124, 137)
+            if timed_out:
+                await self._incus.run(
+                    *self._as_agent(name, "pkill", "-f", run_query_path), timeout=5
+                )
+            files = (
+                await self._collect(name, run_out, include_shared=self.active_count(user_id) <= 1)
+                if not timed_out
+                else []
+            )
+            return AgentResult(text[:MAX_OUTPUT], ok=ok, timed_out=timed_out, files=files)
         finally:
-            if ticker is not None:
-                ticker.cancel()
-        text = (
-            res.out.decode("utf-8", "replace")
-            .replace(token, "[redacted]")
-            .replace(user_token, "[redacted]")
-            .strip()
-        )
-        bad_markers = (
-            "Worker execution is unknown",
-            "Execution outcome is unknown",
-            "Unknown execution blocks this session",
-        )
-        has_bad_marker = any(m in text for m in bad_markers)
-        if has_bad_marker:
-            text = ""
-        ok = res.ok and not has_bad_marker
-        timed_out = res.rc in (124, 137)
-        if timed_out:
-            await self._incus.run(*self._as_agent(name, "pkill", "-f", "hermes_cli"), timeout=5)
-        files = await self._collect(name) if not timed_out else []
-        return AgentResult(text[:MAX_OUTPUT], ok=ok, timed_out=timed_out, files=files)
+            with contextlib.suppress(Exception):
+                await self._incus.run(*self._as_agent(name, "rm", "-rf", run_dir), timeout=10)
 
-    async def _collect(self, name: str) -> list[tuple[str, bytes]]:
+    async def _collect(
+        self, name: str, run_out: str = OUTBOX, *, include_shared: bool = True
+    ) -> list[tuple[str, bytes]]:
+        search_dirs = [run_out]
+        if include_shared and run_out != OUTBOX:
+            search_dirs.append(OUTBOX)
         listing = await self._incus.run(
             *self._as_agent(
-                name, "find", OUTBOX, "-maxdepth", "1", "-type", "f",
-                "-size", f"-{MAX_FILE_KB}k", "-printf", "%f\n",
+                name, "find", *search_dirs, "-maxdepth", "1", "-type", "f",
+                "-size", f"-{MAX_FILE_KB}k", "-printf", "%p\n",
             )
         )  # fmt: skip
         files: list[tuple[str, bytes]] = []
-        for fname in listing.out.decode("utf-8", "replace").splitlines()[:MAX_FILES]:
-            if not FILE_NAME.fullmatch(fname) or fname.startswith("."):
+        seen: set[str] = set()
+        for raw_entry in listing.out.decode("utf-8", "replace").splitlines():
+            raw_entry = raw_entry.strip()
+            if not raw_entry:
+                continue
+            if raw_entry.startswith(f"{HOME}/"):
+                remote_path = raw_entry
+                fname = raw_entry.rsplit("/", 1)[-1]
+            else:
+                fname = raw_entry
+                remote_path = f"{run_out}/{fname}"
+            if not FILE_NAME.fullmatch(fname) or fname.startswith(".") or fname in seen:
                 continue  # names come from the sandbox: never trust them
-            pulled = await self._incus.run("file", "pull", f"{name}{OUTBOX}/{fname}", "-")
+            seen.add(fname)
+            pulled = await self._incus.run("file", "pull", f"{name}{remote_path}", "-")
             if pulled.ok and len(pulled.out) <= MAX_FILE_KB * 1000:
                 files.append((fname, pulled.out))
+            if len(files) >= MAX_FILES:
+                break
         return files

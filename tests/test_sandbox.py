@@ -134,17 +134,44 @@ async def test_disk_quota_failure_never_runs_unlimited(agent_state, incus) -> No
     assert not any("hermes" in c for c in incus.calls)
 
 
-async def test_second_run_waits_for_the_first(agent_state, incus) -> None:
+async def test_concurrent_runs_execute_in_parallel_and_enforce_quota(agent_state, incus) -> None:
     incus.gate = asyncio.Event()
-    first = asyncio.create_task(say(agent_state, 1, "/agent long job"))
-    for _ in range(50):
-        if agent_state.sandbox.is_busy(1):
+    first = asyncio.create_task(say(agent_state, 1, "/agent job one"))
+    second = asyncio.create_task(say(agent_state, 1, "/agent job two"))
+    for _ in range(80):
+        if agent_state.sandbox.active_count(1) == 2:
             break
         await asyncio.sleep(0.01)
-    busy, _ = await say(agent_state, 1, "/agent another")
-    assert busy.text == texts.AGENT_BUSY
+    assert agent_state.sandbox.is_busy(1)
+    assert agent_state.sandbox.active_count(1) == 2
+
+    # Reap must never stop or destroy a container with active runs
+    stopped, destroyed = await agent_state.sandbox.reap()
+    assert (stopped, destroyed) == (0, 0)
+
+    # Release both concurrent runs
     incus.gate.set()
-    assert (await first)[0].text == "agent says hi"
+    r1, p1 = await first
+    r2, p2 = await second
+    assert r1.text == "agent says hi"
+    assert r2.text == "agent says hi"
+    assert p1 == [texts.AGENT_RUNNING]
+    assert p2 == [texts.AGENT_RUNNING]
+    assert not agent_state.sandbox.is_busy(1)
+
+    # Both runs wrote to distinct per-run query files (/home/agent/runs/<run_id>/in/query.txt)
+    run_queries = [
+        v.decode()
+        for k, v in incus.pushed.items()
+        if k.startswith("u1/home/agent/runs/") and k.endswith("/in/query.txt")
+    ]
+    assert len(run_queries) == 2
+    assert any("job one" in q for q in run_queries)
+    assert any("job two" in q for q in run_queries)
+
+    # Quota was deducted for both runs (2 * 5 = 10 of 20)
+    usage_reply, _ = await say(agent_state, 1, "/usage")
+    assert "10 از 20" in usage_reply.text
 
 
 async def test_timeout_keeps_partial_text(agent_state, incus) -> None:
@@ -424,3 +451,34 @@ async def test_unified_hermes_falls_back_on_worker_unknown_output(agent_state, i
     assert "Worker execution is unknown" not in reply.text
     assert reply.text != texts.AGENT_FAILED
     assert "echo:" in reply.text
+
+
+async def test_concurrent_runs_queue_when_user_limit_reached_and_enforce_quota(
+    agent_state, incus
+) -> None:
+    # Default quota is 20 (4 agent runs at cost=5); user max concurrent is 3.
+    incus.gate = asyncio.Event()
+    t1 = asyncio.create_task(say(agent_state, 1, "/agent run 1"))
+    t2 = asyncio.create_task(say(agent_state, 1, "/agent run 2"))
+    t3 = asyncio.create_task(say(agent_state, 1, "/agent run 3"))
+    for _ in range(80):
+        if agent_state.sandbox.active_count(1) == 3:
+            break
+        await asyncio.sleep(0.01)
+    assert agent_state.sandbox.active_count(1) == 3
+
+    # 4th concurrent run has quota (20 - 15 = 5 remaining) and enters the queue instead of failing
+    t4 = asyncio.create_task(say(agent_state, 1, "/agent run 4"))
+    await asyncio.sleep(0.05)
+
+    # 5th concurrent run has 0 remaining quota and is rejected immediately with AGENT_NO_QUOTA
+    r5, _ = await say(agent_state, 1, "/agent run 5")
+    assert r5.text == texts.AGENT_NO_QUOTA.format(cost=5)
+
+    # Release all runs; t1..t4 all complete
+    incus.gate.set()
+    results = await asyncio.gather(t1, t2, t3, t4)
+    for reply, _ in results:
+        assert reply.text == "agent says hi"
+    _, p4 = results[3]
+    assert p4 == [texts.AGENT_QUEUED]
