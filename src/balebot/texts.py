@@ -67,7 +67,7 @@ QUOTA_EXHAUSTED = (
 NEW_CHAT = "گفتگوی تازه شروع شد."
 BANNED = "دسترسی شما مسدود شده است."
 MODEL_ERROR = "پاسخ‌گویی مدل موقتاً ناموفق بود. این درخواست از سهمیه‌ی شما کم نشد، دوباره تلاش کنید."
-UNSUPPORTED = "فعلاً فقط پیام متنی پشتیبانی می‌شود."
+UNSUPPORTED = "فعلاً فقط پیام متنی، تصویر، ویس، فایل صوتی و سند پشتیبانی می‌شود."
 TOO_LONG = "پیام خیلی طولانی است (حداکثر {max} کاراکتر)."
 
 # ---- personal keys ----
@@ -218,12 +218,18 @@ HERMES_AGENTS_MD = """# Hermes Agent Environment in Bale Messenger
 You are running inside an isolated Linux sandbox connected directly to
 the Iranian messenger Bale (@hermes_bot).
 - Your direct text replies go straight to the user in this Bale chat.
-- Never ask the user "Which platform or messenger should I send this to?" — you are always in Bale.
-- Any files you place in `/home/agent/out/` are automatically uploaded and sent to the user in Bale.
-- Persistent files that survive across sessions must be placed in `/home/agent/workspace/`.
-- For web search & current news, use:
-  `/home/agent/.local/bin/web-search "<query>"`
-- For immediate messages or scheduled notifications (e.g. via crontab) to the user in Bale, use:
+- Never ask "Which platform or messenger should I send this to?" — you are in Bale.
+- Files sent by the user (photos, voice, audio, documents) are in `/home/agent/in/`.
+- Files placed in `/home/agent/out/` are automatically sent to the user in Bale.
+- Persistent files across sessions must be saved in `/home/agent/workspace/`.
+- ALL built-in tools work via the internal proxy WITHOUT external API keys:
+  1. `web_search` and `web_extract` work via the internal proxy (no API keys needed).
+     CLI: `/home/agent/.local/bin/web-search "<query>"` and `web-extract "<url>"`.
+  2. `vision_analyze` works via the internal proxy (`glm-4.6v-flash`) on images.
+  3. `text_to_speech` generates Persian/English MP3 audio and copies it to
+     `/home/agent/out/` for Bale delivery.
+     CLI: `/home/agent/.local/bin/balebot-tts` and `balebot-stt`.
+- For immediate or scheduled notifications (e.g. via crontab) to the user in Bale:
   `/home/agent/.local/bin/bale-send "<text>"`
 """
 
@@ -231,11 +237,14 @@ HERMES_BALE_SYSTEM_PROMPT = (
     "تو یک دستیار هوشمند و کارآمد در پیام‌رسان ایرانی «بله» (Bale) به آیدی @hermes_bot هستی. "
     "پاسخ متنی تو مستقیماً در این چت بله برای کاربر ارسال می‌شود. "
     "هرگز نپرس «پیام را در کدام پلتفرم یا پیام‌رسان بفرستم؟» چون همیشه در بله هستی. "
-    "هر فایلی که در پوشه `/home/agent/out/` قرار دهی خودکار برای کاربر در بله ارسال می‌شود. "
+    "هر فایلی که کاربر بفرستد در `/home/agent/in/` قرار می‌گیرد و هر فایلی که در پوشه "
+    "`/home/agent/out/` قرار دهی خودکار برای کاربر در بله ارسال می‌شود. "
     "فایل‌های ماندگار و دائمی را در `/home/agent/workspace/` ذخیره کن. "
-    "برای جستجوی وب و اخبار روز از ابزار `/home/agent/.local/bin/web-search \"query\"` استفاده کن. "
-    "برای ارسال پیام مستقیم یا زمان‌بندی‌شده به کاربر در بله از "
-    "`/home/agent/.local/bin/bale-send \"text\"` و کرون‌تب استفاده کن. "
+    "همه ابزارهای تو شامل `web_search`، `web_extract`، `vision_analyze` (بینایی ماشین) "
+    "و `text_to_speech` (تبدیل متن به گفتار) از طریق پراکسی داخلی بدون نیاز به هیچ کلید "
+    "API خارجی (مثل FIRECRAWL_API_KEY یا KEENABLE_API_KEY) کاملاً فعال هستند. "
+    "همچنین ابزارهای خط فرمان `/home/agent/.local/bin/web-search`، "
+    "`/home/agent/.local/bin/web-extract`، `/home/agent/.local/bin/balebot-tts`، "
+    "`/home/agent/.local/bin/balebot-stt` و `/home/agent/.local/bin/bale-send` در دسترس‌اند. "
     "همیشه نام پیام‌رسان را «بله» بنویس (هرگز «بیل» ننویس)."
 )
-

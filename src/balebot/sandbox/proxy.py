@@ -6,6 +6,7 @@ upstream provider. Bind this app only to the Incus bridge address (e.g. 10.77.0.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import re
@@ -17,7 +18,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select
 
@@ -26,12 +27,17 @@ from balebot.models import Message, User
 from balebot.net.safe_http import UnsafeURL
 from balebot.sandbox import tokens
 from balebot.services import runtime_settings
-from balebot.services.model_client import ModelError, _zai_fallbacks
+from balebot.services.media import (
+    extract_html_text,
+    synthesize_speech_bytes,
+    transcribe_audio_bytes,
+)
+from balebot.services.model_client import ModelError, _has_image_content, _zai_fallbacks
 from balebot.state import AppState
 
 log = logging.getLogger("balebot.sandbox.proxy")
 
-MAX_BODY = 512_000
+MAX_BODY = 12_000_000
 MAX_TOKENS_CAP = 8192
 ALLOWED = {
     "messages",
@@ -119,6 +125,19 @@ def create_proxy_app(state: AppState) -> FastAPI:
         count, _ = used.get(tok.run_id, (0, tok.expires))
         used[tok.run_id] = (count + 1, tok.expires)
         return count + 1
+
+    async def _auth_user(request: Request) -> tuple[User | None, JSONResponse | None]:
+        auth = request.headers.get("authorization", "")
+        token_str = auth.removeprefix("Bearer ").strip()
+        try:
+            user_id = tokens.verify_any_token(state.settings.proxy_secret, token_str)
+        except tokens.BadToken:
+            return None, _error(401, "invalid or expired token")
+        async with state.sessionmaker() as s:
+            user = await s.get(User, user_id)
+        if user is None or user.banned:
+            return None, _error(403, "not allowed")
+        return user, None
 
     @app.get("/v1/props")
     async def props() -> dict[str, Any]:
@@ -221,7 +240,8 @@ def create_proxy_app(state: AppState) -> FastAPI:
             else:
                 url = cfg.base_url.rstrip("/") + "/chat/completions"
                 is_zai = "api.z.ai" in cfg.base_url
-                candidates = _zai_fallbacks(cfg.base_url, cfg.base_model)
+                has_vision = _has_image_content(messages)
+                candidates = _zai_fallbacks(cfg.base_url, cfg.base_model, vision=has_vision)
                 res = None
                 parsed_data: dict[str, Any] | None = None
                 for idx, candidate in enumerate(candidates):
@@ -230,6 +250,9 @@ def create_proxy_app(state: AppState) -> FastAPI:
                     req_body: dict[str, Any] = {**clean, "model": candidate, "stream": False}
                     if is_zai:
                         req_body["thinking"] = {"type": "disabled"}
+                        if has_vision:
+                            req_body.pop("tools", None)
+                            req_body.pop("tool_choice", None)
                     try:
                         res = await state.http.request(
                             "POST",
@@ -270,20 +293,12 @@ def create_proxy_app(state: AppState) -> FastAPI:
 
     @app.post("/v1/bale/notify")
     async def bale_notify(request: Request) -> JSONResponse:
-        auth = request.headers.get("authorization", "")
-        token_str = auth.removeprefix("Bearer ").strip()
-        try:
-            user_id = tokens.verify_any_token(state.settings.proxy_secret, token_str)
-        except tokens.BadToken:
-            return _error(401, "invalid or expired token")
-
-        async with state.sessionmaker() as s:
-            user = await s.get(User, user_id)
-        if user is None or user.banned:
-            return _error(403, "not allowed")
+        user, err = await _auth_user(request)
+        if err is not None or user is None:
+            return err or _error(401, "unauthorized")
 
         today = datetime.now(ZoneInfo(state.settings.timezone)).date()
-        count, count_day = notify_counts.get(user_id, (0, today))
+        count, count_day = notify_counts.get(user.id, (0, today))
         if count_day != today:
             count = 0
         if count >= 30:
@@ -307,22 +322,14 @@ def create_proxy_app(state: AppState) -> FastAPI:
         except Exception:
             return _error(502, "failed to send message via bale")
 
-        notify_counts[user_id] = (count + 1, today)
+        notify_counts[user.id] = (count + 1, today)
         return JSONResponse({"ok": True})
 
     @app.api_route("/v1/web/search", methods=["GET", "POST"])
     async def web_search(request: Request) -> JSONResponse:
-        auth = request.headers.get("authorization", "")
-        token_str = auth.removeprefix("Bearer ").strip()
-        try:
-            user_id = tokens.verify_any_token(state.settings.proxy_secret, token_str)
-        except tokens.BadToken:
-            return _error(401, "invalid or expired token")
-
-        async with state.sessionmaker() as s:
-            user = await s.get(User, user_id)
-        if user is None or user.banned:
-            return _error(403, "not allowed")
+        _, err = await _auth_user(request)
+        if err is not None:
+            return err
 
         query = ""
         if request.method == "POST":
@@ -338,24 +345,41 @@ def create_proxy_app(state: AppState) -> FastAPI:
             return _error(400, "query is required")
 
         results: list[dict[str, str]] = []
-        try:
-            encoded_q = urllib.parse.quote(query)
-            rss_url = f"https://news.google.com/rss/search?q={encoded_q}&hl=fa&gl=IR&ceid=IR:fa"
-            res = await state.http.request("GET", rss_url, timeout=10.0)
-            if res.status == 200:
-                root = ET.fromstring(res.body)  # noqa: S314
-                for item in root.findall(".//item")[:8]:
-                    t_elem = item.find("title")
-                    l_elem = item.find("link")
-                    d_elem = item.find("description")
-                    title = t_elem.text.strip() if t_elem is not None and t_elem.text else ""
-                    link = l_elem.text.strip() if l_elem is not None and l_elem.text else ""
-                    raw_desc = d_elem.text if d_elem is not None and d_elem.text else ""
-                    snippet = re.sub(r"<[^>]+>", "", raw_desc).strip()
-                    if title:
-                        results.append({"title": title, "link": link, "snippet": snippet})
-        except Exception as exc:  # noqa: BLE001
-            log.debug("RSS search attempt failed: %s", exc)
+        encoded_q = urllib.parse.quote(query)
+        rss_urls = [
+            f"https://news.google.com/rss/search?q={encoded_q}&hl=fa&gl=IR&ceid=IR:fa",
+            f"https://www.bing.com/news/search?q={encoded_q}&format=rss",
+            f"https://www.bing.com/search?q={encoded_q}&format=rss",
+        ]
+        news_keys = ("اخبار", "خبر", "ایران", "تهران", "جهان", "news", "iran")
+        if any(k in query.lower() for k in news_keys):
+            rss_urls.extend(
+                [
+                    "https://www.irna.ir/rss",
+                    "https://www.mehrnews.com/rss",
+                ]
+            )
+        for rss_url in rss_urls:
+            if len(results) >= 8:
+                break
+            try:
+                res = await state.http.request(
+                    "GET", rss_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8.0
+                )
+                if res.status == 200 and res.body:
+                    root = ET.fromstring(res.body)  # noqa: S314
+                    for item in root.findall(".//item")[:5]:
+                        t_elem = item.find("title")
+                        l_elem = item.find("link")
+                        d_elem = item.find("description")
+                        title = t_elem.text.strip() if t_elem is not None and t_elem.text else ""
+                        link = l_elem.text.strip() if l_elem is not None and l_elem.text else ""
+                        raw_desc = d_elem.text if d_elem is not None and d_elem.text else ""
+                        snippet = re.sub(r"<[^>]+>", "", raw_desc).strip()
+                        if title:
+                            results.append({"title": title, "link": link, "snippet": snippet})
+            except Exception as exc:  # noqa: BLE001
+                log.debug("RSS search attempt failed (%s): %s", rss_url, exc)
 
         if not results:
             try:
@@ -394,5 +418,147 @@ def create_proxy_app(state: AppState) -> FastAPI:
         return JSONResponse(
             {"ok": True, "query": query, "results": results, "formatted": formatted}
         )
+
+    @app.api_route("/v1/web/extract", methods=["GET", "POST"])
+    async def web_extract(request: Request) -> JSONResponse:
+        _, err = await _auth_user(request)
+        if err is not None:
+            return err
+
+        urls: list[str] = []
+        char_limit = 15000
+        if request.method == "POST":
+            try:
+                body = await request.json()
+                if isinstance(body, dict):
+                    raw_urls = body.get("urls")
+                    if isinstance(raw_urls, list):
+                        for item in raw_urls[:5]:
+                            if isinstance(item, str) and item.strip():
+                                urls.append(item.strip())
+                            elif isinstance(item, dict):
+                                u = item.get("url") or item.get("href")
+                                if isinstance(u, str) and u.strip():
+                                    urls.append(u.strip())
+                    elif isinstance(body.get("url"), str) and body["url"].strip():
+                        urls.append(body["url"].strip())
+                    if isinstance(body.get("char_limit"), int):
+                        char_limit = max(1000, min(body["char_limit"], 50000))
+            except Exception as exc:  # noqa: BLE001
+                log.debug("failed to parse web_extract json body: %s", exc)
+        if not urls:
+            q_url = request.query_params.get("url", "").strip()
+            if q_url:
+                urls.append(q_url)
+        if not urls:
+            return _error(400, "urls is required")
+
+        extracted: list[dict[str, Any]] = []
+        for u in urls[:5]:
+            try:
+                res = await state.http.request(
+                    "GET",
+                    u,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; HermesBot/1.0)"},
+                    timeout=15.0,
+                )
+                if res.status == 200 and res.body:
+                    title, content = extract_html_text(res.body, char_limit=char_limit)
+                    extracted.append(
+                        {
+                            "url": u,
+                            "title": title,
+                            "content": content,
+                            "raw_content": content,
+                            "error": None,
+                        }
+                    )
+                else:
+                    extracted.append(
+                        {
+                            "url": u,
+                            "title": "",
+                            "content": "",
+                            "error": f"HTTP {res.status}",
+                        }
+                    )
+            except UnsafeURL:
+                extracted.append(
+                    {
+                        "url": u,
+                        "title": "",
+                        "content": "",
+                        "error": "Blocked: URL targets a private or internal network address",
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                extracted.append(
+                    {
+                        "url": u,
+                        "title": "",
+                        "content": "",
+                        "error": f"Fetch failed: {type(exc).__name__}",
+                    }
+                )
+
+        return JSONResponse({"ok": True, "success": True, "results": extracted})
+
+    @app.post("/v1/audio/speech", response_model=None)
+    async def audio_speech(request: Request) -> Response:
+        _, err = await _auth_user(request)
+        if err is not None:
+            return err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return _error(400, "invalid json")
+        if not isinstance(body, dict):
+            return _error(400, "json object required")
+
+        text = str(body.get("input") or body.get("text") or "").strip()
+        if not text:
+            return _error(400, "text is required")
+        lang = str(body.get("lang") or body.get("language") or "fa").strip() or "fa"
+        audio_bytes = await synthesize_speech_bytes(state.http, text[:3500], lang=lang)
+        if not audio_bytes:
+            return _error(502, "TTS synthesis failed")
+        if body.get("response_format") == "json":
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "audio_b64": base64.b64encode(audio_bytes).decode("ascii"),
+                    "format": "mp3",
+                }
+            )
+        return Response(content=audio_bytes, media_type="audio/mpeg")
+
+    @app.post("/v1/audio/transcriptions")
+    async def audio_transcriptions(request: Request) -> JSONResponse:
+        _, err = await _auth_user(request)
+        if err is not None:
+            return err
+
+        raw = await request.body()
+        if len(raw) > MAX_BODY:
+            return _error(413, "request too large")
+        try:
+            body = json.loads(raw)
+        except Exception:
+            return _error(400, "invalid json")
+        if not isinstance(body, dict):
+            return _error(400, "json object required")
+
+        audio_b64 = str(body.get("audio_b64") or "").strip()
+        if not audio_b64:
+            return _error(400, "audio_b64 is required")
+        try:
+            audio_bytes = base64.b64decode(audio_b64)
+        except Exception:
+            return _error(400, "invalid base64")
+        ext = str(body.get("ext") or "ogg").strip() or "ogg"
+        lang = str(body.get("language") or "fa-IR").strip() or "fa-IR"
+        transcript = await transcribe_audio_bytes(audio_bytes, ext=ext, language=lang)
+        return JSONResponse({"ok": True, "text": transcript})
 
     return app

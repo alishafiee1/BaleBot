@@ -56,6 +56,7 @@ class FakeBale:
         self.deleted: list[tuple[int, int]] = []
         self.documents: list[tuple[int, str, bytes]] = []
         self.actions: list[tuple[int, str]] = []
+        self.files_store: dict[str, tuple[bytes, str]] = {}
 
     async def send_message(self, chat_id: int, text: str, keyboard=None) -> int:
         msg = SentTuple(chat_id, text, keyboard)
@@ -88,6 +89,11 @@ class FakeBale:
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         self.deleted.append((chat_id, message_id))
+
+    async def get_file(self, file_id: str) -> tuple[bytes, str]:
+        if file_id in self.files_store:
+            return self.files_store[file_id]
+        return b"fake-file-bytes", f"files/{file_id}.bin"
 
     async def send_document(self, chat_id: int, name: str, data: bytes) -> None:
         self.documents.append((chat_id, name, data))

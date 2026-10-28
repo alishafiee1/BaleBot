@@ -18,7 +18,9 @@ from balebot import texts
 from balebot.config import Settings
 from balebot.models import Sandbox, utcnow
 from balebot.sandbox import tokens
+from balebot.sandbox.hermes_patch import HERMES_PATCH_SCRIPT
 from balebot.sandbox.incus import IncusRunner
+from balebot.services.media import sanitize_filename
 
 AGENT_UID = "1000"
 HOME = "/home/agent"
@@ -170,6 +172,7 @@ class SandboxManager:
         token: str,
         session_name: str = "bale",
         on_stage: Callable[[str], Awaitable[None]] | None = None,
+        input_files: list[tuple[str, bytes]] | None = None,
     ) -> AgentResult:
         lock = self._locks.setdefault(user_id, asyncio.Lock())
         async with lock, self._slots:
@@ -184,6 +187,7 @@ class SandboxManager:
                     user_id=user_id,
                     session_name=session_name,
                     on_stage=on_stage,
+                    input_files=input_files,
                 )
             finally:
                 async with self._sm() as s:
@@ -209,6 +213,7 @@ class SandboxManager:
         user_id: int,
         session_name: str = "bale",
         on_stage: Callable[[str], Awaitable[None]] | None = None,
+        input_files: list[tuple[str, bytes]] | None = None,
     ) -> AgentResult:
         s = self._s
         user_token = (
@@ -247,6 +252,20 @@ class SandboxManager:
         )  # fmt: skip
         if not pushed.ok:
             raise SandboxError("could not hand the task to the sandbox")
+
+        for raw_fname, file_bytes in input_files or []:
+            safe_fname = sanitize_filename(raw_fname)
+            await self._incus.run(
+                "file", "push", "-", f"{name}{HOME}/in/{safe_fname}",
+                "--mode", "0644", "--uid", AGENT_UID, "--gid", AGENT_UID,
+                stdin=file_bytes,
+            )  # fmt: skip
+
+        await self._incus.run(
+            "file", "push", "-", f"{name}{HOME}/.proxy_token",
+            "--mode", "0600", "--uid", AGENT_UID, "--gid", AGENT_UID,
+            stdin=user_token.encode(),
+        )  # fmt: skip
 
         # Push AGENTS.md to home and workspace
         agents_bytes = texts.HERMES_AGENTS_MD.encode()
@@ -327,6 +346,135 @@ class SandboxManager:
             "--mode", "0755", "--uid", AGENT_UID, "--gid", AGENT_UID,
             stdin=web_search_script.encode(),
         )  # fmt: skip
+
+
+        extract_url = f"{s.proxy_url.rstrip('/')}/web/extract"
+        web_extract_script = (
+            "#!/usr/bin/env python3\n"
+            "import json, sys, urllib.request\n\n"
+            f"URL = {extract_url!r}\n"
+            f"TOKEN = {user_token!r}\n\n"
+            "urls = [a.strip() for a in sys.argv[1:] if a.strip()]\n"
+            "if not urls:\n"
+            "    raw = sys.stdin.read().strip()\n"
+            "    if raw:\n"
+            "        urls = [raw]\n"
+            "if not urls:\n"
+            "    print('Usage: web-extract <url> [url2 ...]')\n"
+            "    sys.exit(1)\n"
+            "req = urllib.request.Request(\n"
+            "    URL,\n"
+            "    data=json.dumps({'urls': urls}).encode(),\n"
+            "    headers={\n"
+            "        'Content-Type': 'application/json',\n"
+            "        'Authorization': f'Bearer {TOKEN}',\n"
+            "    },\n"
+            "    method='POST',\n"
+            ")\n"
+            "try:\n"
+            "    with urllib.request.urlopen(req, timeout=30) as r:\n"
+            "        data = json.loads(r.read().decode())\n"
+            "        for item in data.get('results', []):\n"
+            "            print(f\"=== {item.get('title') or item.get('url')} ===\")\n"
+            "            print(item.get('content') or item.get('error') or '')\n"
+            "except Exception as e:\n"
+            "    print(f'Extract error: {e}', file=sys.stderr)\n"
+            "    sys.exit(1)\n"
+        )
+        await self._incus.run(
+            "file", "push", "-", f"{name}{HOME}/.local/bin/web-extract",
+            "--mode", "0755", "--uid", AGENT_UID, "--gid", AGENT_UID,
+            stdin=web_extract_script.encode(),
+        )  # fmt: skip
+
+        tts_url = f"{s.proxy_url.rstrip('/')}/audio/speech"
+        tts_script = (
+            "#!/usr/bin/env python3\n"
+            "import json, sys, urllib.request\n\n"
+            f"URL = {tts_url!r}\n"
+            f"TOKEN = {user_token!r}\n\n"
+            "args = sys.argv[1:]\n"
+            "out_path = '/home/agent/out/voice.mp3'\n"
+            "last = args[-1] if len(args) >= 2 else ''\n"
+            "if last and (last.endswith(('.mp3', '.ogg')) or '/' in last):\n"
+            "    out_path = args[-1]\n"
+            "    text = ' '.join(args[:-1]).strip()\n"
+            "else:\n"
+            "    text = (' '.join(args) if args else sys.stdin.read()).strip()\n"
+            "if not text:\n"
+            "    print('Usage: balebot-tts <text> [output_path]')\n"
+            "    sys.exit(1)\n"
+            "req = urllib.request.Request(\n"
+            "    URL,\n"
+            "    data=json.dumps({'input': text, 'lang': 'fa'}).encode(),\n"
+            "    headers={\n"
+            "        'Content-Type': 'application/json',\n"
+            "        'Authorization': f'Bearer {TOKEN}',\n"
+            "    },\n"
+            "    method='POST',\n"
+            ")\n"
+            "try:\n"
+            "    with urllib.request.urlopen(req, timeout=45) as r:\n"
+            "        audio = r.read()\n"
+            "    with open(out_path, 'wb') as f:\n"
+            "        f.write(audio)\n"
+            "    print(json.dumps({'success': True, 'file_path': out_path, 'bytes': len(audio)}))\n"
+            "except Exception as e:\n"
+            "    print(f'TTS error: {e}', file=sys.stderr)\n"
+            "    sys.exit(1)\n"
+        )
+        await self._incus.run(
+            "file", "push", "-", f"{name}{HOME}/.local/bin/balebot-tts",
+            "--mode", "0755", "--uid", AGENT_UID, "--gid", AGENT_UID,
+            stdin=tts_script.encode(),
+        )  # fmt: skip
+
+        stt_url = f"{s.proxy_url.rstrip('/')}/audio/transcriptions"
+        stt_script = (
+            "#!/usr/bin/env python3\n"
+            "import base64, json, os, sys, urllib.request\n\n"
+            f"URL = {stt_url!r}\n"
+            f"TOKEN = {user_token!r}\n\n"
+            "if len(sys.argv) < 2:\n"
+            "    print('Usage: balebot-stt <audio_file_path> [language]')\n"
+            "    sys.exit(1)\n"
+            "path = sys.argv[1]\n"
+            "lang = sys.argv[2] if len(sys.argv) > 2 else 'fa-IR'\n"
+            "ext = os.path.splitext(path)[1].lstrip('.') or 'ogg'\n"
+            "with open(path, 'rb') as f:\n"
+            "    b64 = base64.b64encode(f.read()).decode('ascii')\n"
+            "req = urllib.request.Request(\n"
+            "    URL,\n"
+            "    data=json.dumps({'audio_b64': b64, 'ext': ext, 'language': lang}).encode(),\n"
+            "    headers={\n"
+            "        'Content-Type': 'application/json',\n"
+            "        'Authorization': f'Bearer {TOKEN}',\n"
+            "    },\n"
+            "    method='POST',\n"
+            ")\n"
+            "try:\n"
+            "    with urllib.request.urlopen(req, timeout=60) as r:\n"
+            "        data = json.loads(r.read().decode())\n"
+            "        print(data.get('text', ''))\n"
+            "except Exception as e:\n"
+            "    print(f'STT error: {e}', file=sys.stderr)\n"
+            "    sys.exit(1)\n"
+        )
+        await self._incus.run(
+            "file", "push", "-", f"{name}{HOME}/.local/bin/balebot-stt",
+            "--mode", "0755", "--uid", AGENT_UID, "--gid", AGENT_UID,
+            stdin=stt_script.encode(),
+        )  # fmt: skip
+        await self._incus.run(
+            "file", "push", "-", f"{name}{HOME}/.local/bin/balebot-patch-hermes",
+            "--mode", "0755", "--uid", AGENT_UID, "--gid", AGENT_UID,
+            stdin=HERMES_PATCH_SCRIPT.encode(),
+        )  # fmt: skip
+        await self._incus.run(
+            *self._as_agent(
+                name, "python3", f"{HOME}/.local/bin/balebot-patch-hermes"
+            )
+        )
 
         if on_stage:
             await on_stage("🛠 مرحله ۳ از ۳: در حال تفکر و اجرای ابزارها در محیط ایزوله...")

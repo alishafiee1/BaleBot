@@ -10,7 +10,7 @@ class ModelError(Exception):
 
 class ModelClient(Protocol):
     async def chat(
-        self, *, base_url: str, api_key: str, model: str, messages: list[dict[str, str]]
+        self, *, base_url: str, api_key: str, model: str, messages: list[dict[str, Any]]
     ) -> str: ...
 
 
@@ -25,9 +25,21 @@ def _extract_reply_text(data: dict[str, Any]) -> str:
     return ""
 
 
-def _zai_fallbacks(base_url: str, model: str) -> list[str]:
+def _has_image_content(messages: list[dict[str, Any]]) -> bool:
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in ("image_url", "image"):
+                    return True
+    return False
+
+
+def _zai_fallbacks(base_url: str, model: str, *, vision: bool = False) -> list[str]:
     if "api.z.ai" not in base_url:
         return [model]
+    if vision:
+        return ["glm-4.6v-flash", "glm-4v-flash", "glm-4.6v-flash"]
     alt = "glm-4.7-flash" if model == "glm-4.5-flash" else "glm-4.5-flash"
     return [model, alt, model, alt]
 
@@ -39,11 +51,12 @@ class OpenAICompatClient:
         self._http = httpx.AsyncClient(timeout=timeout)
 
     async def chat(
-        self, *, base_url: str, api_key: str, model: str, messages: list[dict[str, str]]
+        self, *, base_url: str, api_key: str, model: str, messages: list[dict[str, Any]]
     ) -> str:
         url = base_url.rstrip("/") + "/chat/completions"
         headers = {"Authorization": "Bearer " + api_key}
-        candidates = _zai_fallbacks(base_url, model)
+        has_vision = _has_image_content(messages)
+        candidates = _zai_fallbacks(base_url, model, vision=has_vision)
         is_zai = "api.z.ai" in base_url
         last_exc: Exception | None = None
         for idx, candidate in enumerate(candidates):

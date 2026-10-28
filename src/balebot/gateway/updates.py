@@ -1,9 +1,11 @@
 import logging
+import os
 import time
 from typing import Any
 
 from balebot import texts
 from balebot.gateway.bale import MAX_MESSAGE
+from balebot.services.media import IncomingMedia, sanitize_filename
 from balebot.services.reply import Reply
 from balebot.state import AppState
 
@@ -71,12 +73,84 @@ async def process_update(state: AppState, update: dict[str, Any]) -> None:
         log.warning("update failed update_id=%s: %s", uid, type(exc).__name__)
 
 
+async def _extract_media(state: AppState, message: dict[str, Any]) -> IncomingMedia | None:
+    photos = message.get("photo")
+    if isinstance(photos, list) and photos:
+        best = photos[-1]
+        if isinstance(best, dict) and best.get("file_id"):
+            data, file_path = await state.bale.get_file(str(best["file_id"]))
+            ext = os.path.splitext(file_path)[1].lower() or ".jpg"
+            mime = (
+                "image/png"
+                if ext == ".png"
+                else ("image/webp" if ext == ".webp" else "image/jpeg")
+            )
+            return IncomingMedia(
+                kind="photo",
+                filename=sanitize_filename(f"photo{ext}", "photo.jpg"),
+                data=data,
+                mime_type=mime,
+            )
+
+    voice = message.get("voice")
+    if isinstance(voice, dict) and voice.get("file_id"):
+        data, file_path = await state.bale.get_file(str(voice["file_id"]))
+        ext = os.path.splitext(file_path)[1].lower() or ".ogg"
+        mime = str(voice.get("mime_type") or "audio/ogg")
+        return IncomingMedia(
+            kind="voice",
+            filename=sanitize_filename(f"voice{ext}", "voice.ogg"),
+            data=data,
+            mime_type=mime,
+        )
+
+    audio = message.get("audio")
+    if isinstance(audio, dict) and audio.get("file_id"):
+        data, file_path = await state.bale.get_file(str(audio["file_id"]))
+        ext = os.path.splitext(file_path)[1].lower() or ".mp3"
+        orig_name = str(audio.get("file_name") or f"audio{ext}")
+        mime = str(audio.get("mime_type") or "audio/mpeg")
+        return IncomingMedia(
+            kind="audio",
+            filename=sanitize_filename(orig_name, f"audio{ext}"),
+            data=data,
+            mime_type=mime,
+        )
+
+    doc = message.get("document")
+    if isinstance(doc, dict) and doc.get("file_id"):
+        data, file_path = await state.bale.get_file(str(doc["file_id"]))
+        ext = os.path.splitext(file_path)[1].lower() or ".bin"
+        orig_name = str(doc.get("file_name") or f"document{ext}")
+        mime = str(doc.get("mime_type") or "application/octet-stream")
+        kind = "document"
+        if mime.startswith("image/") or ext in (".jpg", ".jpeg", ".png", ".webp"):
+            kind = "photo"
+        elif mime.startswith("audio/") or ext in (".ogg", ".oga", ".mp3", ".wav", ".m4a"):
+            kind = "audio"
+        return IncomingMedia(
+            kind=kind,
+            filename=sanitize_filename(orig_name, f"document{ext}"),
+            data=data,
+            mime_type=mime,
+        )
+
+    return None
+
+
 async def _message(state: AppState, message: dict[str, Any]) -> None:
     chat_id = int(message["chat"]["id"])
     sender = message.get("from") or {}
     bale_id = int(sender.get("id", chat_id))
-    text = message.get("text")
-    if text is None:
+    raw_text = message.get("text")
+    caption = message.get("caption")
+    text = (
+        raw_text
+        if isinstance(raw_text, str)
+        else (caption if isinstance(caption, str) else None)
+    )
+    has_media = any(k in message for k in ("photo", "voice", "audio", "document"))
+    if text is None and not has_media:
         await _send(state, chat_id, Reply(texts.UNSUPPORTED))
         return
     message_id = message.get("message_id")
@@ -104,20 +178,32 @@ async def _message(state: AppState, message: dict[str, Any]) -> None:
             await state.bale.edit_message(chat_id, progress_msg_id, stage_text)
             last_edit_ts = time.monotonic()
 
-    stripped = text.strip()
-    if not stripped.startswith("/") or stripped == "/agent" or stripped.startswith("/agent "):
+    stripped = (text or "").strip()
+    is_agent_cmd = stripped == "/agent" or stripped.startswith("/agent ")
+    if has_media or not stripped.startswith("/") or is_agent_cmd:
         try:
             await state.bale.send_chat_action(chat_id, "typing")
         except Exception as exc:  # noqa: BLE001
             log.debug("sendChatAction failed: %s", type(exc).__name__)
 
+    media: IncomingMedia | None = None
+    if has_media:
+        try:
+            media = await _extract_media(state, message)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("failed to download incoming media: %s", type(exc).__name__)
+            if not stripped:
+                await _send(state, chat_id, Reply(texts.MODEL_ERROR))
+                return
+
     reply = await state.chat.handle_message(
         bale_id,
         sender.get("username"),
-        text,
+        text or "",
         delete_incoming,
         progress=progress,
         on_stage=on_stage,
+        media=media,
     )
     await _send(state, chat_id, reply, progress_msg_id=progress_msg_id)
     await _send_files(state, chat_id, reply)

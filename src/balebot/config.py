@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     agent_max_turns: int = 20
     agent_max_llm_calls: int = 40  # per run, enforced by the LLM proxy
     agent_max_concurrent: int = 3
-    agent_toolsets: str = "terminal,file,web"  # comma list passed to hermes -t
+    agent_toolsets: str = "terminal,file,web,vision,tts"  # comma list passed to hermes -t
     # secret that signs the short-lived tokens the sandbox uses to reach the LLM proxy
     proxy_secret: str = ""
     # how a sandbox reaches the proxy (bridge address of the sandbox network)

@@ -5,6 +5,7 @@ import httpx
 from balebot import texts
 
 MAX_MESSAGE = 3500
+MAX_FILE_BYTES = 15 * 1024 * 1024
 
 
 class BaleApi(Protocol):
@@ -24,6 +25,7 @@ class BaleApi(Protocol):
     async def set_my_commands(self, commands: list[dict[str, str]] | None = None) -> bool: ...
     async def delete_message(self, chat_id: int, message_id: int) -> None: ...
     async def send_document(self, chat_id: int, name: str, data: bytes) -> None: ...
+    async def get_file(self, file_id: str) -> tuple[bytes, str]: ...
     async def answer_callback(self, callback_id: str) -> None: ...
     async def send_chat_action(self, chat_id: int, action: str = "typing") -> None: ...
     async def get_updates(self, offset: int, timeout: int = 30) -> list[dict[str, Any]]: ...
@@ -35,6 +37,7 @@ class BaleClient:
 
     def __init__(self, token: str) -> None:
         self._base = f"https://tapi.bale.ai/bot{token}/"
+        self._file_base = f"https://tapi.bale.ai/file/bot{token}/"
         self._http = httpx.AsyncClient(timeout=60.0)
 
     async def _call(self, method: str, payload: dict[str, Any], timeout: float = 40.0) -> Any:
@@ -114,6 +117,18 @@ class BaleClient:
         await self._call(
             "deleteMessage", {"chat_id": chat_id, "message_id": message_id}, timeout=15.0
         )
+
+    async def get_file(self, file_id: str) -> tuple[bytes, str]:
+        data = await self._call("getFile", {"file_id": file_id}, timeout=20.0)
+        result = data.get("result") if isinstance(data, dict) else None
+        file_path = str((result or {}).get("file_path") or "").lstrip("/")
+        if not file_path:
+            raise ValueError("missing file_path")
+        resp = await self._http.get(self._file_base + file_path, timeout=60.0)
+        resp.raise_for_status()
+        if len(resp.content) > MAX_FILE_BYTES:
+            raise ValueError("file too large")
+        return resp.content, file_path
 
     async def send_document(self, chat_id: int, name: str, data: bytes) -> None:
         resp = await self._http.post(

@@ -127,7 +127,7 @@ class KeyService:
             raise ModelError("bad reply")
         return data
 
-    async def chat(self, route: Route, messages: list[dict[str, str]]) -> str:
+    async def chat(self, route: Route, messages: list[dict[str, Any]]) -> str:
         data = await self.raw_chat(route, {"messages": messages})
         try:
             msg = data["choices"][0]["message"]
