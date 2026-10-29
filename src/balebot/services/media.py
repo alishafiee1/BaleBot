@@ -4,16 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
+import hashlib
 import html
 import json
 import logging
 import re
 import shutil
+import struct
 import tempfile
+import time
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from balebot.net.safe_http import SafeHttp
 
@@ -290,23 +296,240 @@ async def transcribe_audio_bytes(data: bytes, ext: str = "ogg", language: str = 
     return ""
 
 
+_IMAGE_FALLBACK_CACHE: dict[str, str] = {}
+
+
+def _extract_raw_image_bytes(data_url: str) -> bytes:
+    if not data_url:
+        return b""
+    if "," in data_url and data_url.startswith("data:"):
+        try:
+            return base64.b64decode(data_url.split(",", 1)[1])
+        except Exception:  # noqa: BLE001
+            return b""
+    return b""
+
+
+def get_cached_image_description(data_url: str) -> str:
+    """Return cached visual + OCR description for a data_url if already computed."""
+    raw = _extract_raw_image_bytes(data_url)
+    if not raw:
+        return ""
+    key = hashlib.sha256(raw).hexdigest()
+    return _IMAGE_FALLBACK_CACHE.get(key, "")
+
+
+def _parse_image_dimensions(raw: bytes) -> str:
+    """Extract widthxheight from PNG or JPEG header in pure Python."""
+    if len(raw) >= 24 and raw[:8] == b"\x89PNG\r\n\x1a\n" and raw[12:16] == b"IHDR":
+        w, h = struct.unpack(">II", raw[16:24])
+        if w > 0 and h > 0:
+            return f"{w}x{h}"
+    if len(raw) > 4 and raw[:2] == b"\xff\xd8":
+        idx = 2
+        n = len(raw)
+        while idx + 8 < n:
+            if raw[idx] != 0xFF:
+                idx += 1
+                continue
+            marker = raw[idx + 1]
+            while marker == 0xFF and idx + 2 < n:
+                idx += 1
+                marker = raw[idx + 1]
+            if marker in (0xD8, 0xD9):
+                idx += 2
+                continue
+            if idx + 4 > n:
+                break
+            seg_len = struct.unpack(">H", raw[idx + 2 : idx + 4])[0]
+            if seg_len < 2 or idx + 2 + seg_len > n:
+                break
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3) and idx + 9 <= n:
+                h, w = struct.unpack(">HH", raw[idx + 5 : idx + 9])
+                if w > 0 and h > 0:
+                    return f"{w}x{h}"
+            idx += 2 + seg_len
+    return ""
+
+
+def _gradio_upload_bytes(base_url: str, prefix: str, data: bytes) -> str:
+    boundary = uuid.uuid4().hex
+    body = (
+        (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="files"; filename="image.jpg"\r\n'
+            "Content-Type: image/jpeg\r\n\r\n"
+        ).encode()
+        + data
+        + f"\r\n--{boundary}--\r\n".encode()
+    )
+    req = urllib.request.Request(  # noqa: S310
+        f"{base_url}{prefix}/upload",
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "Mozilla/5.0",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+        uploaded = json.loads(resp.read().decode("utf-8", "ignore"))
+    if isinstance(uploaded, list) and uploaded and isinstance(uploaded[0], str):
+        return uploaded[0]
+    return ""
+
+
+def _gradio_sse_call(
+    base_url: str,
+    prefix: str,
+    endpoint: str,
+    payload_data: list[Any],
+    max_wait: float = 16.0,
+) -> str:
+    ep = endpoint.lstrip("/")
+    req = urllib.request.Request(  # noqa: S310
+        f"{base_url}{prefix}/call/{ep}",
+        data=json.dumps({"data": payload_data}).encode(),
+        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+        ev_obj = json.loads(resp.read().decode("utf-8", "ignore"))
+    event_id = ev_obj.get("event_id") if isinstance(ev_obj, dict) else ""
+    if not isinstance(event_id, str) or not event_id:
+        return ""
+    req2 = urllib.request.Request(  # noqa: S310
+        f"{base_url}{prefix}/call/{ep}/{event_id}",
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    t_start = time.monotonic()
+    cur_event = ""
+    last_data = ""
+    with urllib.request.urlopen(req2, timeout=max_wait) as resp2:  # noqa: S310
+        while time.monotonic() - t_start < max_wait:
+            raw_line = resp2.readline()
+            if not raw_line:
+                break
+            line = raw_line.decode("utf-8", "ignore").strip()
+            if line.startswith("event:"):
+                cur_event = line.split(":", 1)[1].strip()
+            elif line.startswith("data:"):
+                d = line.split(":", 1)[1].strip()
+                if d and d != "null":
+                    last_data = d
+                if cur_event in ("complete", "error"):
+                    break
+    if cur_event != "complete" or not last_data:
+        return ""
+    try:
+        parsed = json.loads(last_data)
+        if isinstance(parsed, list) and parsed:
+            val = str(parsed[0] or "").strip()
+            val = re.sub(r"\s*⏱\s*Took\s+[0-9.]+\s+seconds\s*$", "", val).strip()
+            return val
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Gradio parse failed: %s", exc)
+    return ""
+
+
+def _gradio_vlm_caption_sync(raw_bytes: bytes) -> str:
+    """Caption visual scene and objects using CPU-hosted Florence-2 & BLIP-Large Spaces."""
+    if len(raw_bytes) < 64:
+        return ""
+
+    specs: list[tuple[str, str, str, str, Any]] = [
+        (
+            "florence_sd3",
+            "https://gokaygokay-florence-2-sd3-captioner.hf.space",
+            "",
+            "run_example",
+            lambda up: [{"path": up, "meta": {"_type": "gradio.FileData"}}],
+        ),
+        (
+            "blip_large",
+            "https://tonyassi-blip-image-captioning-large.hf.space",
+            "/gradio_api",
+            "predict",
+            lambda up: [{"path": up, "meta": {"_type": "gradio.FileData"}}, 15, 60],
+        ),
+        (
+            "florence_base",
+            "https://prithivmlmods-florence-2-image-caption.hf.space",
+            "/gradio_api",
+            "describe_image",
+            lambda up: [{"path": up, "meta": {"_type": "gradio.FileData"}}, "Florence-2-base"],
+        ),
+    ]
+
+    def _run_spec(spec: tuple[str, str, str, str, Any]) -> tuple[str, str]:
+        name, url, pfx, ep, build_args = spec
+        try:
+            up = _gradio_upload_bytes(url, pfx, raw_bytes)
+            if not up:
+                return name, ""
+            ans = _gradio_sse_call(url, pfx, ep, build_args(up), max_wait=15.0)
+            return name, ans
+        except Exception as exc:  # noqa: BLE001
+            log.debug("VLM captioner %s failed: %s", name, exc)
+            return name, ""
+
+    results: dict[str, str] = {}
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+    try:
+        futs = [pool.submit(_run_spec, s) for s in specs]
+        deadline = time.monotonic() + 15.5
+        pending = set(futs)
+        while pending and time.monotonic() < deadline:
+            rem = max(0.2, deadline - time.monotonic())
+            done, pending = concurrent.futures.wait(
+                pending,
+                timeout=min(1.0, rem),
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for f in done:
+                try:
+                    k, v = f.result()
+                    if v:
+                        results[k] = v
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("VLM future error: %s", exc)
+            has_detailed = bool(results.get("florence_sd3") or results.get("florence_base"))
+            has_blip = bool(results.get("blip_large"))
+            if has_detailed and has_blip:
+                break
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    captions: list[str] = []
+    if results.get("florence_sd3"):
+        captions.append(f"- Detailed Scene Caption: {results['florence_sd3']}")
+    if results.get("florence_base") and results.get("florence_base") != results.get("florence_sd3"):
+        captions.append(f"- Visual Layout & Objects: {results['florence_base']}")
+    if results.get("blip_large"):
+        captions.append(f"- Main Subject Summary: {results['blip_large']}")
+    return "\n".join(captions)
+
+
 def _ocr_space_sync(data_url: str) -> str:
     """Extract text from a base64 image data_url using OCR.space free endpoint."""
     if not data_url.startswith("data:image/"):
+        return ""
+    raw = _extract_raw_image_bytes(data_url)
+    if len(raw) < 64:
         return ""
     for engine_params in (
         {"apikey": "helloworld", "base64Image": data_url, "OCREngine": "3", "language": "auto"},
         {"apikey": "helloworld", "base64Image": data_url, "OCREngine": "2"},
     ):
         try:
-            payload = urllib.parse.urlencode(engine_params).encode("utf-8")
+            payload = urllib.parse.urlencode(engine_params).encode()
             req = urllib.request.Request(
                 "https://api.ocr.space/parse/image",
                 data=payload,
                 headers={"User-Agent": "Mozilla/5.0"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310
+            with urllib.request.urlopen(req, timeout=18) as resp:  # noqa: S310
                 obj = json.loads(resp.read().decode("utf-8", "ignore"))
             texts: list[str] = []
             for item in obj.get("ParsedResults") or []:
@@ -322,72 +545,98 @@ def _ocr_space_sync(data_url: str) -> str:
     return ""
 
 
-async def describe_image_fallback(data_url: str) -> str:
-    """Extract OCR text and visual metadata when upstream vision model is overloaded (429)."""
-    ocr_text = await asyncio.to_thread(_ocr_space_sync, data_url)
-    color_info = ""
+async def _inspect_image_colors(raw_bytes: bytes) -> str:
+    if not raw_bytes:
+        return ""
+    dim_str = _parse_image_dimensions(raw_bytes) or "unknown"
+    color_info = f"Resolution: {dim_str}" if dim_str != "unknown" else ""
     try:
-        if "," in data_url:
-            raw_bytes = base64.b64decode(data_url.split(",", 1)[1])
-            cmd: list[str] | None = None
-            if shutil.which("ffmpeg"):
-                cmd = [
-                    "ffmpeg",
-                    "-i",
-                    "pipe:0",
-                    "-vf",
-                    "scale=3:3",
-                    "-frames:v",
-                    "1",
-                    "-f",
-                    "rawvideo",
-                    "-pix_fmt",
-                    "rgb24",
-                    "pipe:1",
-                ]
-            elif shutil.which("incus"):
-                cmd = [
-                    "incus",
-                    "--project",
-                    "balebot",
-                    "exec",
-                    "u1",
-                    "--",
-                    "ffmpeg",
-                    "-i",
-                    "pipe:0",
-                    "-vf",
-                    "scale=3:3",
-                    "-frames:v",
-                    "1",
-                    "-f",
-                    "rawvideo",
-                    "-pix_fmt",
-                    "rgb24",
-                    "pipe:1",
-                ]
-            if cmd:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+        cmd: list[str] | None = None
+        if shutil.which("ffmpeg"):
+            cmd = [
+                "ffmpeg",
+                "-i",
+                "pipe:0",
+                "-vf",
+                "scale=3:3",
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1",
+            ]
+        elif shutil.which("incus"):
+            cmd = [
+                "incus",
+                "--project",
+                "balebot",
+                "exec",
+                "u1",
+                "--",
+                "ffmpeg",
+                "-i",
+                "pipe:0",
+                "-vf",
+                "scale=3:3",
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1",
+            ]
+        if cmd:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await asyncio.wait_for(proc.communicate(raw_bytes), timeout=12.0)
+            err_str = err.decode("utf-8", "ignore")
+            dim_m = re.search(r" (\d{1,5}x\d{1,5})[\s,]", err_str)
+            if dim_m:
+                dim_str = dim_m.group(1)
+            if len(out) >= 27:
+                tl = (out[0], out[1], out[2])
+                c = (out[12], out[13], out[14])
+                br = (out[24], out[25], out[26])
+                color_info = (
+                    f"Resolution: {dim_str}, "
+                    f"TopLeft RGB: {tl}, Center RGB: {c}, BottomRight RGB: {br}"
                 )
-                out, err = await asyncio.wait_for(proc.communicate(raw_bytes), timeout=15.0)
-                err_str = err.decode("utf-8", "ignore")
-                dim_m = re.search(r" (\d{1,5}x\d{1,5})[\s,]", err_str)
-                dim_str = dim_m.group(1) if dim_m else "unknown"
-                if len(out) >= 27:
-                    r, g, b = out[12], out[13], out[14]
-                    color_info = f"Resolution: {dim_str}, Center RGB: ({r}, {g}, {b})"
     except Exception as exc:  # noqa: BLE001
         log.debug("Image color inspection failed: %s", exc)
+    return color_info
+
+
+async def describe_image_fallback(data_url: str) -> str:
+    """Extract VLM scene description, OCR text, and color metadata when vision is 429."""
+    raw_bytes = _extract_raw_image_bytes(data_url)
+    cache_key = hashlib.sha256(raw_bytes).hexdigest() if raw_bytes else ""
+    if cache_key and cache_key in _IMAGE_FALLBACK_CACHE:
+        return _IMAGE_FALLBACK_CACHE[cache_key]
+
+    vlm_task = asyncio.to_thread(_gradio_vlm_caption_sync, raw_bytes)
+    ocr_task = asyncio.to_thread(_ocr_space_sync, data_url)
+    color_task = _inspect_image_colors(raw_bytes)
+    vlm_caption, ocr_text, color_info = await asyncio.gather(vlm_task, ocr_task, color_task)
 
     parts: list[str] = []
+    if vlm_caption:
+        parts.append(f"Visual Scene & Objects Description (VLM):\n{vlm_caption}")
     if color_info:
-        parts.append(color_info)
+        parts.append(f"Image Technical Metadata: {color_info}")
     if ocr_text:
-        parts.append(f"Extracted OCR Text from image:\n{ocr_text}")
+        parts.append(f"Extracted Text on Image (OCR):\n{ocr_text}")
     else:
-        parts.append("No readable text detected in the image via OCR.")
-    return "\n".join(parts)
+        parts.append("Extracted Text on Image (OCR): No readable text written on the image.")
+    result = "\n\n".join(parts)
+    if cache_key and (vlm_caption or ocr_text):
+        if len(_IMAGE_FALLBACK_CACHE) >= 64:
+            _IMAGE_FALLBACK_CACHE.pop(next(iter(_IMAGE_FALLBACK_CACHE)), None)
+        _IMAGE_FALLBACK_CACHE[cache_key] = result
+    return result

@@ -276,30 +276,46 @@ def create_proxy_app(state: AppState) -> FastAPI:
                         if isinstance(loaded, dict):
                             parsed_data = loaded
                             break
+                    if res.status == 429 and has_vision and is_zai and b"1305" in res.body:
+                        break
                     if res.status not in (429, 500, 502, 503, 504) or idx + 1 >= len(candidates):
                         break
                 if parsed_data is None and has_vision and is_zai:
                     fallback_msgs = await rewrite_vision_messages_for_text_fallback(messages)
-                    fb_body: dict[str, Any] = {
-                        **clean,
-                        "messages": fallback_msgs,
-                        "model": cfg.base_model,
-                        "stream": False,
-                        "thinking": {"type": "disabled"},
-                    }
-                    fb_body.pop("tools", None)
-                    fb_body.pop("tool_choice", None)
-                    res = await state.http.request(
-                        "POST",
-                        url,
-                        headers={"Authorization": "Bearer " + state.settings.base_model_api_key},
-                        json=fb_body,
-                        timeout=45.0,
+                    base_fb = (
+                        "glm-4.7-flash" if cfg.base_model == "glm-4.6v-flash" else cfg.base_model
                     )
-                    if res.status == 200:
-                        loaded = json.loads(res.body)
-                        if isinstance(loaded, dict):
-                            parsed_data = loaded
+                    fb_candidates = _zai_fallbacks(cfg.base_url, base_fb, vision=False)
+                    for fb_idx, fb_cand in enumerate(fb_candidates):
+                        if fb_idx > 0:
+                            await asyncio.sleep(1.0 * fb_idx)
+                        fb_body: dict[str, Any] = {
+                            **clean,
+                            "messages": fallback_msgs,
+                            "model": fb_cand,
+                            "stream": False,
+                            "thinking": {"type": "disabled"},
+                        }
+                        fb_body.pop("tools", None)
+                        fb_body.pop("tool_choice", None)
+                        res = await state.http.request(
+                            "POST",
+                            url,
+                            headers={
+                                "Authorization": "Bearer " + state.settings.base_model_api_key
+                            },
+                            json=fb_body,
+                            timeout=45.0,
+                        )
+                        if res.status == 200:
+                            loaded = json.loads(res.body)
+                            if isinstance(loaded, dict):
+                                parsed_data = loaded
+                                break
+                        if res.status not in (429, 500, 502, 503, 504) or fb_idx + 1 >= len(
+                            fb_candidates
+                        ):
+                            break
 
                 if parsed_data is None:
                     if res is not None and res.status != 200:

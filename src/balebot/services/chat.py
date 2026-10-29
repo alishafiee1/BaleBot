@@ -18,7 +18,11 @@ from balebot.sandbox import tokens
 from balebot.sandbox.manager import SandboxError, SandboxManager
 from balebot.services import quota, runtime_settings
 from balebot.services.keys import Deleter, KeyService
-from balebot.services.media import IncomingMedia, transcribe_audio_bytes
+from balebot.services.media import (
+    IncomingMedia,
+    get_cached_image_description,
+    transcribe_audio_bytes,
+)
 from balebot.services.model_client import ModelClient, ModelError
 from balebot.services.reply import Reply
 
@@ -303,8 +307,21 @@ class ChatService:
                     await s.commit()
             return Reply(texts.MODEL_ERROR)
 
+        final_stored_user = stored_user_text or text
+        if isinstance(user_content, list):
+            for part in user_content:
+                if isinstance(part, dict) and part.get("type") in ("image_url", "image"):
+                    img_obj = part.get("image_url")
+                    u = img_obj.get("url", "") if isinstance(img_obj, dict) else str(img_obj or "")
+                    cached_desc = get_cached_image_description(u)
+                    if cached_desc:
+                        final_stored_user = (
+                            f"{final_stored_user}\n[خلاصه بصری و متنی تصویر:\n{cached_desc[:1000]}]"
+                        )
+                    break
+
         async with self._sm() as s:
-            s.add(Message(user_id=user_id, role="user", content=stored_user_text or text))
+            s.add(Message(user_id=user_id, role="user", content=final_stored_user))
             s.add(Message(user_id=user_id, role="assistant", content=reply_text))
             await s.commit()
         return Reply(reply_text)

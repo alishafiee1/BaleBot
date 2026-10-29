@@ -60,7 +60,12 @@ async def rewrite_vision_messages_for_text_fallback(
                 img_obj = part.get("image_url")
                 url = img_obj.get("url", "") if isinstance(img_obj, dict) else str(img_obj or "")
                 meta = await describe_image_fallback(url)
-                text_parts.append(f"[اطلاعات استخراج‌شده از تصویر (OCR و مشخصات بصری)]:\n{meta}")
+                text_parts.append(
+                    "[تحلیل کامل بصری صحنه، اشیاء و متن تصویر (VLM + OCR)]:\n"
+                    f"{meta}\n\n"
+                    "(راهنما: مستقیم و طبیعی به فارسی پاسخ بده؛ عبارت «بر اساس توصیف ارائه‌شده» "
+                    "نگو و طوری پاسخ بده که انگار خودت مستقیم تصویر را دیده‌ای.)"
+                )
         rewritten.append({**m, "content": "\n\n".join(text_parts)})
     return rewritten
 
@@ -101,6 +106,11 @@ class OpenAICompatClient:
                     headers=headers,
                     json=payload,
                 )
+                if resp.status_code == 429 and has_vision and is_zai and "1305" in resp.text:
+                    last_exc = httpx.HTTPStatusError(
+                        "429 vision overloaded", request=resp.request, response=resp
+                    )
+                    break
                 if resp.status_code in (429, 500, 502, 503, 504) and idx + 1 < len(candidates):
                     continue
                 resp.raise_for_status()
@@ -117,24 +127,34 @@ class OpenAICompatClient:
                 return str(content)
 
         if has_vision and is_zai:
-            try:
-                fallback_msgs = await rewrite_vision_messages_for_text_fallback(messages)
-                fallback_model = "glm-4.7-flash" if model == "glm-4.6v-flash" else model
-                resp = await self._http.post(
-                    url,
-                    headers=headers,
-                    json={
-                        "model": fallback_model,
-                        "messages": fallback_msgs,
-                        "thinking": {"type": "disabled"},
-                    },
-                )
-                resp.raise_for_status()
-                content = _extract_reply_text(resp.json())
-                if content:
-                    return str(content)
-            except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError) as exc:
-                last_exc = exc
+            fallback_msgs = await rewrite_vision_messages_for_text_fallback(messages)
+            base_fb = "glm-4.7-flash" if model == "glm-4.6v-flash" else model
+            fb_candidates = _zai_fallbacks(base_url, base_fb, vision=False)
+            for fb_idx, fb_cand in enumerate(fb_candidates):
+                if fb_idx > 0:
+                    await asyncio.sleep(1.0 * fb_idx)
+                try:
+                    resp = await self._http.post(
+                        url,
+                        headers=headers,
+                        json={
+                            "model": fb_cand,
+                            "messages": fallback_msgs,
+                            "thinking": {"type": "disabled"},
+                        },
+                    )
+                    if resp.status_code in (429, 500, 502, 503, 504) and fb_idx + 1 < len(
+                        fb_candidates
+                    ):
+                        continue
+                    resp.raise_for_status()
+                    content = _extract_reply_text(resp.json())
+                    if content:
+                        return str(content)
+                except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError) as exc:
+                    last_exc = exc
+                    if fb_idx + 1 < len(fb_candidates):
+                        continue
 
         if last_exc is not None:
             raise ModelError(type(last_exc).__name__) from None
